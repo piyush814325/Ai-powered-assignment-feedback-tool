@@ -1,0 +1,34 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments and environment files
+.env
+.env.*
+**/.env
+
+# Uploaded/generated project files
+backend/uploads/
+uploads/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.env
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
