@@ -174,7 +174,7 @@ export function Badge({ className, variant = 'neutral', ...props }: BadgeProps) 
 /* ---------------------------------------------------------------------- */
 
 interface AlertProps {
-    variant?: 'error' | 'success' | 'info';
+    variant?: 'error' | 'success' | 'info' | 'warning';
     children: React.ReactNode;
     className?: string;
 }
@@ -183,6 +183,7 @@ const alertVariants = {
     error: 'bg-red-50 border-red-200 text-red-800 dark:bg-red-950/40 dark:border-red-900 dark:text-red-300',
     success: 'bg-emerald-50 border-emerald-200 text-emerald-800 dark:bg-emerald-950/40 dark:border-emerald-900 dark:text-emerald-300',
     info: 'bg-blue-50 border-blue-200 text-blue-800 dark:bg-blue-950/40 dark:border-blue-900 dark:text-blue-300',
+    warning: 'bg-amber-50 border-amber-200 text-amber-800 dark:bg-amber-950/40 dark:border-amber-900 dark:text-amber-300',
 };
 
 export function Alert({ variant = 'info', children, className }: AlertProps) {

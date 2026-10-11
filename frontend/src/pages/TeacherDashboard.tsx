@@ -41,6 +41,7 @@ export default function TeacherDashboard() {
     const [saveSuccess, setSaveSuccess] = useState(false);
     const [showSourceCode, setShowSourceCode] = useState(false);
     const [showAssignmentModal, setShowAssignmentModal] = useState(false);
+    const [showManageAssignmentsModal, setShowManageAssignmentsModal] = useState(false);
     const [editingAssignment, setEditingAssignment] = useState<Assignment | null>(null);
     const [assignmentError, setAssignmentError] = useState('');
     const [assignmentForm, setAssignmentForm] = useState({
@@ -245,8 +246,11 @@ export default function TeacherDashboard() {
                         <div className="flex flex-col space-y-3">
                             <div className="flex justify-between items-center">
                                 <h2 className="text-xl font-bold text-foreground">Submission queue</h2>
-                                <div className="flex gap-2">
+                                <div className="flex flex-wrap gap-2">
                                     <Button size="sm" onClick={() => openAssignmentModal()}><Plus className="h-4 w-4" />Create assignment</Button>
+                                    <Button variant="outline" size="sm" onClick={() => setShowManageAssignmentsModal(true)}>
+                                        Assignments ({assignments.length})
+                                    </Button>
                                     <Button variant="outline" size="sm" onClick={loadSubmissions}><RefreshCw className="h-4 w-4" />Reload</Button>
                                 </div>
                             </div>
@@ -523,6 +527,82 @@ export default function TeacherDashboard() {
                     <fieldset><legend className="block text-sm font-medium text-foreground mb-1.5">Allowed file types</legend><div className="flex flex-wrap gap-4">{['pdf', 'docx', 'txt', 'code', 'image'].map((type) => <label key={type} className="flex items-center gap-2 text-sm text-foreground"><input type="checkbox" checked={assignmentForm.allowed_file_types.includes(type)} onChange={(e) => setAssignmentForm({ ...assignmentForm, allowed_file_types: e.target.checked ? [...assignmentForm.allowed_file_types, type] : assignmentForm.allowed_file_types.filter((item) => item !== type) })} />{type.toUpperCase()}</label>)}</div></fieldset>
                     <div className="flex justify-end gap-2 pt-2"><Button type="button" variant="outline" onClick={() => setShowAssignmentModal(false)}>Cancel</Button><Button type="submit" disabled={assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0) !== Number(assignmentForm.max_score) || assignmentForm.rubric.some((criterion) => !criterion.label.trim())}>{editingAssignment ? 'Save changes' : 'Create assignment'}</Button></div>
                 </form>
+            </Modal>
+
+            <Modal
+                open={showManageAssignmentsModal}
+                onClose={() => setShowManageAssignmentsModal(false)}
+                title="Manage assignments"
+                subtitle="View, edit, or toggle active assignments"
+                widthClassName="max-w-3xl"
+            >
+                <div className="p-6 space-y-4">
+                    {assignments.length === 0 ? (
+                        <EmptyState
+                            title="No assignments created yet"
+                            description="Click 'Create assignment' to set up your first rubric and assignment."
+                            action={
+                                <Button size="sm" onClick={() => { setShowManageAssignmentsModal(false); openAssignmentModal(); }}>
+                                    <Plus className="h-4 w-4" /> Create assignment
+                                </Button>
+                            }
+                        />
+                    ) : (
+                        <div className="space-y-3">
+                            {assignments.map((assignment) => (
+                                <div
+                                    key={assignment.id}
+                                    className="p-4 rounded-xl border border-border bg-card/60 flex flex-col sm:flex-row justify-between sm:items-center gap-3"
+                                >
+                                    <div className="min-w-0">
+                                        <div className="flex items-center gap-2">
+                                            <h4 className="font-bold text-sm text-foreground truncate">{assignment.title}</h4>
+                                            <Badge variant={assignment.is_active ? 'success' : 'neutral'}>
+                                                {assignment.is_active ? 'Active' : 'Inactive'}
+                                            </Badge>
+                                        </div>
+                                        <p className="text-xs text-muted-foreground mt-0.5">
+                                            {assignment.subject_code} · {assignment.subject_name} · Max {assignment.max_score} pts · {assignment.rubric?.length ?? 0} criteria
+                                        </p>
+                                        {assignment.due_date && (
+                                            <p className="text-[11px] text-muted-foreground">Due: {formatDate(assignment.due_date)}</p>
+                                        )}
+                                    </div>
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        <Button
+                                            size="sm"
+                                            variant="outline"
+                                            onClick={() => toggleAssignment(assignment)}
+                                            title={assignment.is_active ? 'Deactivate' : 'Activate'}
+                                        >
+                                            {assignment.is_active ? 'Deactivate' : 'Activate'}
+                                        </Button>
+                                        <Button
+                                            size="sm"
+                                            variant="outline"
+                                            onClick={() => {
+                                                setShowManageAssignmentsModal(false);
+                                                openAssignmentModal(assignment);
+                                            }}
+                                            title="Edit assignment"
+                                        >
+                                            <Edit3 className="h-3.5 w-3.5" />
+                                            Edit
+                                        </Button>
+                                        <Button
+                                            size="sm"
+                                            variant="destructive"
+                                            onClick={() => deactivateAssignment(assignment)}
+                                            title="Delete assignment"
+                                        >
+                                            <Trash2 className="h-3.5 w-3.5" />
+                                        </Button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
             </Modal>
         </div>
     );
