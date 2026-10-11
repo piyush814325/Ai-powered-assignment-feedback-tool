@@ -1,12 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import auth, submissions
+from app.routers import assignments, auth, submissions
 from app.database import Base, engine, SessionLocal
 from app.models import Rubric
+from app.migration import migrate_legacy_submission_assignments, migrate_assignment_rubrics, migrate_evaluation_two_stage_fields
 import app.models  # Import models so they register with Base.metadata
 
 # Create tables in database if they don't exist
 Base.metadata.create_all(bind=engine)
+migrate_legacy_submission_assignments(engine)
+migrate_assignment_rubrics(engine)
+migrate_evaluation_two_stage_fields(engine)
 
 def seed_default_rubric():
     db = SessionLocal()
@@ -50,6 +54,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(assignments.router)
 app.include_router(submissions.router)
 
 @app.get("/health")

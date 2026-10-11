@@ -1,57 +1,58 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { CheckCircle2, Code2, Edit3, GraduationCap, ListChecks, Plus, RefreshCw, Trash2, Zap, Sparkles } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
-import { submissionsAPI } from '../services/api';
-import { Button, Card, Input } from '../ui/components';
+import { assignmentsAPI, submissionsAPI } from '../services/api';
+import { Button, Card, Input, Badge, Spinner, EmptyState, Alert, FormField, Modal, Textarea } from '../ui/components';
+import { StatCard } from '../components/dashboard/StatCard';
+import { EvaluationCriteria } from '../components/dashboard/EvaluationCriteria';
+import { ClassificationBadges } from '../components/dashboard/ClassificationBadges';
+import { IssuesPanel } from '../components/dashboard/IssuesPanel';
+import { VisualContentWarning } from '../components/dashboard/VisualContentWarning';
 import ThemeToggle from '../components/ThemeToggle';
+import { formatDate, formatDateTime, fileName, getSubmissionDisplayTitle } from '../lib/grading';
+import type { Submission } from '../types/submission';
+import type { Assignment, RubricCriterion } from '../types/assignment';
 
-interface Evaluation {
-    id: number;
-    submission_id: number;
-    total_score: number;
-    ai_confidence: number;
-    is_reviewed: boolean;
-    scores: Record<string, number>;
-    feedback: Record<string, string>;
-    evidence?: Record<string, string>;
+type FilterTab = 'pending' | 'reviewed' | 'all';
+
+interface ApiError {
+    response?: { data?: { detail?: string } };
 }
 
-interface Submission {
-    id: number;
-    student_id: number;
-    assignment_id: string;
-    file_path: string;
-    file_type: string;
-    status: string;
-    extracted_text?: string;
-    extracted_code?: string;
-    created_at: string;
-    evaluation?: Evaluation;
-}
+const emptyRubric = (): RubricCriterion[] => [
+    { key: '', label: '', description: '', max_points: 25 },
+    { key: '', label: '', description: '', max_points: 25 },
+    { key: '', label: '', description: '', max_points: 25 },
+    { key: '', label: '', description: '', max_points: 25 },
+];
 
 export default function TeacherDashboard() {
     const { user, logout } = useAuthStore();
     const [submissions, setSubmissions] = useState<Submission[]>([]);
+    const [assignments, setAssignments] = useState<Assignment[]>([]);
     const [loading, setLoading] = useState(true);
     const [selectedSubmission, setSelectedSubmission] = useState<Submission | null>(null);
-    const [filterTab, setFilterTab] = useState<'pending' | 'reviewed' | 'all'>('pending');
+    const [filterTab, setFilterTab] = useState<FilterTab>('pending');
     const [searchTerm, setSearchTerm] = useState('');
-    
-    // Teacher override state
+
     const [editedScores, setEditedScores] = useState<Record<string, number>>({});
     const [editedFeedback, setEditedFeedback] = useState<Record<string, string>>({});
     const [isSaving, setIsSaving] = useState(false);
     const [saveSuccess, setSaveSuccess] = useState(false);
     const [showSourceCode, setShowSourceCode] = useState(false);
-
-    useEffect(() => {
-        loadSubmissions();
-    }, []);
+    const [showAssignmentModal, setShowAssignmentModal] = useState(false);
+    const [editingAssignment, setEditingAssignment] = useState<Assignment | null>(null);
+    const [assignmentError, setAssignmentError] = useState('');
+    const [assignmentForm, setAssignmentForm] = useState({
+        subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code', 'image'], rubric: emptyRubric(), is_active: true,
+    });
 
     useEffect(() => {
         if (selectedSubmission?.evaluation) {
             setEditedScores({ ...selectedSubmission.evaluation.scores });
             setEditedFeedback({ ...selectedSubmission.evaluation.feedback });
             setSaveSuccess(false);
+            setShowSourceCode(false);
         }
     }, [selectedSubmission]);
 
@@ -60,23 +61,86 @@ export default function TeacherDashboard() {
             setLoading(true);
             const response = await submissionsAPI.listSubmissions();
             setSubmissions(response.data);
-            if (response.data.length > 0 && !selectedSubmission) {
-                const pending = response.data.find((s: Submission) => s.evaluation && !s.evaluation.is_reviewed);
-                setSelectedSubmission(pending || response.data[0]);
-            }
-        } catch (error) {
-            console.error('Failed to load submissions', error);
+            setSelectedSubmission((current) => {
+                if (!current) {
+                    const pending = response.data.find((s: Submission) => s.evaluation && !s.evaluation.is_reviewed);
+                    return pending ?? response.data[0] ?? null;
+                }
+                const updated = response.data.find((s: Submission) => s.id === current.id);
+                return updated ?? current;
+            });
+        } catch (err) {
+            console.error('Failed to load submissions', err);
         } finally {
             setLoading(false);
         }
     };
 
-    const handleScoreChange = (criterion: string, val: number) => {
-        setEditedScores(prev => ({ ...prev, [criterion]: Math.min(100, Math.max(0, val)) }));
+    const loadAssignments = async () => {
+        try {
+            const response = await assignmentsAPI.list();
+            setAssignments(response.data);
+        } catch (err) {
+            console.error('Failed to load assignments', err);
+        }
+    };
+
+    useEffect(() => {
+        loadSubmissions();
+        loadAssignments();
+    }, []);
+
+    const openAssignmentModal = (assignment?: Assignment) => {
+        setEditingAssignment(assignment ?? null);
+        setAssignmentError('');
+        setAssignmentForm(assignment ? {
+            subject_name: assignment.subject_name, subject_code: assignment.subject_code, title: assignment.title,
+            description: assignment.description ?? '', due_date: assignment.due_date ? assignment.due_date.slice(0, 16) : '',
+            max_score: String(assignment.max_score), allowed_file_types: assignment.allowed_file_types, rubric: assignment.rubric, is_active: assignment.is_active,
+        } : { subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code', 'image'], rubric: emptyRubric(), is_active: true });
+        setShowAssignmentModal(true);
+    };
+
+    const saveAssignment = async (event: React.FormEvent) => {
+        event.preventDefault();
+        const rubricTotal = assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0);
+        if (!assignmentForm.subject_name.trim() || !assignmentForm.subject_code.trim() || !assignmentForm.title.trim() || !assignmentForm.due_date || assignmentForm.allowed_file_types.length === 0) {
+            setAssignmentError('Subject name, code, title, due date, and at least one file type are required.');
+            return;
+        }
+        if (!assignmentForm.rubric.length || assignmentForm.rubric.some((criterion) => !criterion.label.trim()) || rubricTotal !== Number(assignmentForm.max_score)) {
+            setAssignmentError('Add labeled criteria whose points add up to the maximum score.');
+            return;
+        }
+        try {
+            const payload = { ...assignmentForm, max_score: Number(assignmentForm.max_score), due_date: new Date(assignmentForm.due_date).toISOString() };
+            if (editingAssignment) await assignmentsAPI.update(editingAssignment.id, payload);
+            else await assignmentsAPI.create(payload);
+            setShowAssignmentModal(false);
+            await loadAssignments();
+        } catch (err) {
+            const apiError = err as ApiError;
+            setAssignmentError(apiError.response?.data?.detail || 'Could not save assignment');
+        }
+    };
+
+    const toggleAssignment = async (assignment: Assignment) => {
+        await assignmentsAPI.update(assignment.id, { is_active: !assignment.is_active });
+        await loadAssignments();
+    };
+
+    const deactivateAssignment = async (assignment: Assignment) => {
+        await assignmentsAPI.remove(assignment.id);
+        await loadAssignments();
+    };
+
+    const handleScoreChange = (criterion: string, value: number) => {
+        const maxPoints = selectedSubmission?.assignment?.rubric.find((item) => item.key === criterion)?.max_points ?? 100;
+        setEditedScores((prev) => ({ ...prev, [criterion]: Math.min(maxPoints, Math.max(0, value)) }));
     };
 
     const handleFeedbackChange = (criterion: string, text: string) => {
-        setEditedFeedback(prev => ({ ...prev, [criterion]: text }));
+        setEditedFeedback((prev) => ({ ...prev, [criterion]: text }));
     };
 
     const handleSaveAndApprove = async () => {
@@ -86,15 +150,15 @@ export default function TeacherDashboard() {
             await submissionsAPI.updateEvaluation(selectedSubmission.evaluation.id, {
                 scores: editedScores,
                 feedback: editedFeedback,
-                is_reviewed: true
+                is_reviewed: true,
             });
             setSaveSuccess(true);
             setTimeout(() => {
                 setSaveSuccess(false);
                 loadSubmissions();
             }, 1200);
-        } catch (error) {
-            console.error('Failed to update evaluation', error);
+        } catch (err) {
+            console.error('Failed to update evaluation', err);
         } finally {
             setIsSaving(false);
         }
@@ -104,149 +168,133 @@ export default function TeacherDashboard() {
         if (!selectedSubmission) return;
         try {
             setIsSaving(true);
-            await submissionsAPI.evaluate(selectedSubmission.id, 1, true);
+            await submissionsAPI.evaluate(selectedSubmission.id, undefined, true);
             await loadSubmissions();
-        } catch (error) {
-            console.error('Failed to re-evaluate', error);
+        } catch (err) {
+            console.error('Failed to re-evaluate', err);
         } finally {
             setIsSaving(false);
         }
     };
 
-    const pendingReview = submissions.filter(s => s.evaluation && !s.evaluation.is_reviewed);
-    const reviewed = submissions.filter(s => s.evaluation && s.evaluation.is_reviewed);
+    const pendingReview = useMemo(() => submissions.filter((s) => s.evaluation && !s.evaluation.is_reviewed), [submissions]);
+    const reviewed = useMemo(() => submissions.filter((s) => s.evaluation && s.evaluation.is_reviewed), [submissions]);
 
-    const filteredSubmissions = submissions.filter(s => {
-        const matchesTab = filterTab === 'pending'
-            ? (s.evaluation && !s.evaluation.is_reviewed)
-            : filterTab === 'reviewed'
-                ? (s.evaluation && s.evaluation.is_reviewed)
-                : true;
-        const matchesSearch = s.assignment_id.toLowerCase().includes(searchTerm.toLowerCase()) ||
-            s.student_id.toString().includes(searchTerm);
-        return matchesTab && matchesSearch;
-    });
+    const filteredSubmissions = useMemo(
+        () =>
+            submissions.filter((s) => {
+                const matchesTab =
+                    filterTab === 'pending'
+                        ? s.evaluation && !s.evaluation.is_reviewed
+                        : filterTab === 'reviewed'
+                            ? s.evaluation && s.evaluation.is_reviewed
+                            : true;
+                const query = searchTerm.toLowerCase();
+                const displayTitle = getSubmissionDisplayTitle(s);
+                const matchesSearch =
+                    displayTitle.toLowerCase().includes(query) || s.student_id.toString().includes(searchTerm);
+                return matchesTab && matchesSearch;
+            }),
+        [submissions, filterTab, searchTerm],
+    );
 
-    const evaluatedCount = submissions.filter(s => s.evaluation?.total_score != null).length;
-    const classAvgScore = evaluatedCount > 0
-        ? submissions.reduce((acc, curr) => acc + (curr.evaluation?.total_score || 0), 0) / evaluatedCount
+    const evaluatedCount = submissions.filter((s) => s.evaluation?.total_score != null).length;
+    const classAvgScore = evaluatedCount
+        ? submissions.reduce((acc, s) => acc + (s.evaluation?.total_score ?? 0), 0) / evaluatedCount
         : 0;
 
     return (
         <div className="min-h-screen bg-slate-50 dark:bg-slate-900 text-foreground">
-            {/* Header */}
             <header className="border-b border-border bg-card/80 backdrop-blur shadow-sm sticky top-0 z-10">
                 <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
                     <div className="flex items-center gap-3">
-                        <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-purple-600 to-indigo-600 flex items-center justify-center text-white font-bold text-lg shadow-md">
-                            🎓
+                        <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-purple-600 to-indigo-600 flex items-center justify-center text-white shadow-md">
+                            <GraduationCap className="h-5 w-5" aria-hidden="true" />
                         </div>
                         <div>
-                            <h1 className="text-xl font-bold tracking-tight text-foreground">Instructor Dashboard</h1>
-                            <p className="text-xs text-muted-foreground">Evaluation Review & Score Override Control</p>
+                            <h1 className="text-xl font-bold tracking-tight text-foreground">Instructor dashboard</h1>
+                            <p className="text-xs text-muted-foreground">Review evaluations and override scores</p>
                         </div>
                     </div>
                     <div className="flex items-center gap-4">
                         <ThemeToggle />
                         <div className="text-right hidden sm:block">
                             <p className="text-sm font-semibold text-foreground">{user?.full_name}</p>
-                            <span className="px-2 py-0.5 rounded text-xs font-semibold bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300">
+                            <Badge variant="info" className="bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300">
                                 {user?.role?.toUpperCase()}
-                            </span>
+                            </Badge>
                         </div>
-                        <Button variant="outline" size="sm" onClick={() => logout()} className="hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition">
-                            Logout
+                        <Button variant="outline" size="sm" onClick={() => logout()}>
+                            Log out
                         </Button>
                     </div>
                 </div>
             </header>
 
             <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-                {/* Analytics Overview Cards */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                    <Card className="p-5 border-l-4 border-l-purple-500 shadow-sm hover:shadow transition">
-                        <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Total Submissions</p>
-                        <p className="text-3xl font-extrabold text-foreground mt-2">{submissions.length}</p>
-                    </Card>
-                    <Card className="p-5 border-l-4 border-l-amber-500 shadow-sm hover:shadow transition bg-amber-50/40 dark:bg-amber-950/10">
-                        <p className="text-xs font-medium text-amber-700 dark:text-amber-400 uppercase tracking-wider">Pending Review</p>
-                        <p className="text-3xl font-extrabold text-amber-600 dark:text-amber-400 mt-2">{pendingReview.length}</p>
-                    </Card>
-                    <Card className="p-5 border-l-4 border-l-emerald-500 shadow-sm hover:shadow transition bg-emerald-50/40 dark:bg-emerald-950/10">
-                        <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400 uppercase tracking-wider">Approved / Reviewed</p>
-                        <p className="text-3xl font-extrabold text-emerald-600 dark:text-emerald-400 mt-2">{reviewed.length}</p>
-                    </Card>
-                    <Card className="p-5 border-l-4 border-l-indigo-500 shadow-sm hover:shadow transition">
-                        <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Class Average Score</p>
-                        <p className="text-3xl font-extrabold text-indigo-600 dark:text-indigo-400 mt-2">
-                            {evaluatedCount > 0 ? `${classAvgScore.toFixed(1)}%` : 'N/A'}
-                        </p>
-                    </Card>
+                    <StatCard label="Total submissions" value={submissions.length} accent="purple" />
+                    <StatCard label="Pending review" value={pendingReview.length} accent="amber" />
+                    <StatCard label="Approved" value={reviewed.length} accent="emerald" />
+                    <StatCard label="Class average" value={evaluatedCount ? `${classAvgScore.toFixed(1)}%` : 'N/A'} accent="indigo" />
                 </div>
 
-                {/* Submissions & Review Split View */}
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                    {/* Left Column: Submissions Queue */}
+                    {/* Queue */}
                     <div className="lg:col-span-5 space-y-4">
                         <div className="flex flex-col space-y-3">
                             <div className="flex justify-between items-center">
-                                <h2 className="text-xl font-bold text-foreground">Submission Queue</h2>
-                                <Button variant="outline" size="sm" onClick={loadSubmissions}>🔄 Reload</Button>
+                                <h2 className="text-xl font-bold text-foreground">Submission queue</h2>
+                                <div className="flex gap-2">
+                                    <Button size="sm" onClick={() => openAssignmentModal()}><Plus className="h-4 w-4" />Create assignment</Button>
+                                    <Button variant="outline" size="sm" onClick={loadSubmissions}><RefreshCw className="h-4 w-4" />Reload</Button>
+                                </div>
                             </div>
 
-                            {/* Search & Tabs */}
-                            <div className="flex flex-col sm:flex-row gap-2">
-                                <Input
-                                    type="text"
-                                    placeholder="Search by assignment or student..."
-                                    value={searchTerm}
-                                    onChange={(e) => setSearchTerm(e.target.value)}
-                                    className="flex-1 text-xs"
-                                />
-                            </div>
+                            <Input
+                                type="text"
+                                placeholder="Search by assignment or student…"
+                                value={searchTerm}
+                                onChange={(e) => setSearchTerm(e.target.value)}
+                                className="text-xs"
+                                aria-label="Search submissions"
+                            />
 
-                            <div className="flex border-b border-border text-xs font-semibold">
-                                <button
-                                    onClick={() => setFilterTab('pending')}
-                                    className={`py-2 px-3 border-b-2 transition ${
-                                        filterTab === 'pending'
+                            <div className="flex border-b border-border text-xs font-semibold" role="tablist">
+                                {(
+                                    [
+                                        ['pending', `Pending (${pendingReview.length})`],
+                                        ['reviewed', `Approved (${reviewed.length})`],
+                                        ['all', `All (${submissions.length})`],
+                                    ] as const
+                                ).map(([tab, label]) => (
+                                    <button
+                                        key={tab}
+                                        role="tab"
+                                        aria-selected={filterTab === tab}
+                                        onClick={() => setFilterTab(tab)}
+                                        className={`py-2 px-3 border-b-2 transition ${filterTab === tab
                                             ? 'border-purple-600 text-purple-600 dark:text-purple-400'
                                             : 'border-transparent text-muted-foreground hover:text-foreground'
-                                    }`}
-                                >
-                                    ⏳ Pending ({pendingReview.length})
-                                </button>
-                                <button
-                                    onClick={() => setFilterTab('reviewed')}
-                                    className={`py-2 px-3 border-b-2 transition ${
-                                        filterTab === 'reviewed'
-                                            ? 'border-purple-600 text-purple-600 dark:text-purple-400'
-                                            : 'border-transparent text-muted-foreground hover:text-foreground'
-                                    }`}
-                                >
-                                    ✓ Approved ({reviewed.length})
-                                </button>
-                                <button
-                                    onClick={() => setFilterTab('all')}
-                                    className={`py-2 px-3 border-b-2 transition ${
-                                        filterTab === 'all'
-                                            ? 'border-purple-600 text-purple-600 dark:text-purple-400'
-                                            : 'border-transparent text-muted-foreground hover:text-foreground'
-                                    }`}
-                                >
-                                    All ({submissions.length})
-                                </button>
+                                            }`}
+                                    >
+                                        {label}
+                                    </button>
+                                ))}
                             </div>
                         </div>
 
                         {loading ? (
-                            <Card className="p-8 text-center">
-                                <div className="animate-spin text-purple-600 text-xl mb-2">⏳</div>
-                                <p className="text-muted-foreground text-sm">Loading queue...</p>
+                            <Card className="p-8 flex flex-col items-center gap-2">
+                                <Spinner className="h-5 w-5 text-purple-600" />
+                                <p className="text-muted-foreground text-sm">Loading queue…</p>
                             </Card>
                         ) : filteredSubmissions.length === 0 ? (
-                            <Card className="p-8 text-center">
-                                <p className="text-muted-foreground text-sm">No submissions match the current filter.</p>
+                            <Card>
+                                <EmptyState
+                                    icon={<ListChecks className="h-7 w-7" />}
+                                    title="No submissions match this filter"
+                                />
                             </Card>
                         ) : (
                             <div className="space-y-3 max-h-[700px] overflow-y-auto pr-1">
@@ -255,44 +303,42 @@ export default function TeacherDashboard() {
                                     return (
                                         <Card
                                             key={sub.id}
-                                            className={`p-4 cursor-pointer transition border ${
+                                            interactive
+                                            className={
                                                 isSelected
-                                                    ? 'border-purple-600 shadow-md ring-1 ring-purple-600 bg-purple-50/20 dark:bg-purple-950/20'
-                                                    : 'hover:border-purple-300 hover:shadow-sm'
-                                            }`}
+                                                    ? 'p-4 border-purple-600 shadow-md ring-1 ring-purple-600 bg-purple-50/20 dark:bg-purple-950/20'
+                                                    : 'p-4 hover:border-purple-300'
+                                            }
                                             onClick={() => setSelectedSubmission(sub)}
                                         >
                                             <div className="flex justify-between items-start gap-2">
-                                                <div>
+                                                <div className="min-w-0">
                                                     <div className="flex items-center gap-2">
-                                                        <h3 className="font-bold text-foreground text-sm">{sub.assignment_id}</h3>
-                                                        <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
+                                                        <h3 className="font-bold text-foreground text-sm truncate">{getSubmissionDisplayTitle(sub)}</h3>
+                                                        <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-muted text-muted-foreground shrink-0">
                                                             {sub.file_type}
                                                         </span>
                                                     </div>
                                                     <p className="text-xs text-muted-foreground mt-1">
-                                                        Student ID: <span className="font-medium text-foreground">#{sub.student_id}</span>
+                                                        Student #{sub.student_id}
                                                     </p>
-                                                    <p className="text-[11px] text-muted-foreground">
-                                                        {new Date(sub.created_at).toLocaleDateString()}
-                                                    </p>
+                                                    <p className="text-[11px] text-muted-foreground">{formatDate(sub.created_at)}</p>
                                                 </div>
 
                                                 {sub.evaluation && (
-                                                    <div className="text-right">
+                                                    <div className="text-right shrink-0">
                                                         <span className="text-2xl font-black text-purple-600 dark:text-purple-400">
                                                             {sub.evaluation.total_score?.toFixed(1)}
                                                         </span>
                                                         <p className="text-[10px] text-muted-foreground">
-                                                            {(sub.evaluation.ai_confidence * 100).toFixed(0)}% AI Conf.
+                                                            {(sub.evaluation.ai_confidence * 100).toFixed(0)}% AI conf.
                                                         </p>
-                                                        <span className={`inline-block mt-1 px-2 py-0.5 rounded text-[10px] font-bold ${
-                                                            sub.evaluation.is_reviewed
-                                                                ? 'bg-emerald-100 text-emerald-800'
-                                                                : 'bg-amber-100 text-amber-800'
-                                                        }`}>
-                                                            {sub.evaluation.is_reviewed ? 'Approved' : 'Needs Review'}
-                                                        </span>
+                                                        <Badge
+                                                            variant={sub.evaluation.is_reviewed ? 'success' : 'warning'}
+                                                            className="mt-1"
+                                                        >
+                                                            {sub.evaluation.is_reviewed ? 'Approved' : 'Needs review'}
+                                                        </Badge>
                                                     </div>
                                                 )}
                                             </div>
@@ -303,166 +349,181 @@ export default function TeacherDashboard() {
                         )}
                     </div>
 
-                    {/* Right Column: Detailed Review & Score Override Inspector */}
+                    {/* Inspector */}
                     <div className="lg:col-span-7 space-y-4">
                         {selectedSubmission ? (
-                            <Card className="p-6 space-y-6 shadow-md border-border">
-                                {/* Header Info */}
+                            <Card className="p-6 space-y-6 shadow-md">
                                 <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-4 pb-4 border-b border-border">
-                                    <div>
+                                    <div className="min-w-0">
                                         <div className="flex items-center gap-2">
-                                            <h2 className="text-2xl font-extrabold text-foreground">{selectedSubmission.assignment_id}</h2>
-                                            <span className="px-2.5 py-0.5 rounded text-xs font-bold bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300">
+                                            <h2 className="text-2xl font-extrabold text-foreground truncate">
+                                                {getSubmissionDisplayTitle(selectedSubmission)}
+                                            </h2>
+                                            <Badge className="bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300 shrink-0">
                                                 Student #{selectedSubmission.student_id}
-                                            </span>
+                                            </Badge>
                                         </div>
-                                        <p className="text-xs text-muted-foreground mt-1">
-                                            File: {selectedSubmission.file_path.split('/').pop()} | Submitted {new Date(selectedSubmission.created_at).toLocaleString()}
+                                        <p className="text-xs text-muted-foreground mt-1 truncate">
+                                            {fileName(selectedSubmission.file_path)} · Submitted {formatDateTime(selectedSubmission.created_at)}
                                         </p>
                                     </div>
 
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-2 shrink-0">
                                         <Button
                                             variant="outline"
                                             size="sm"
-                                            onClick={() => setShowSourceCode(!showSourceCode)}
-                                            className="text-xs"
+                                            onClick={() => setShowSourceCode((v) => !v)}
                                         >
-                                            {showSourceCode ? '📊 View Criteria' : '📄 Inspector Text'}
+                                            {showSourceCode ? <ListChecks className="h-3.5 w-3.5" /> : <Code2 className="h-3.5 w-3.5" />}
+                                            {showSourceCode ? 'View criteria' : 'View source'}
                                         </Button>
                                         <Button
                                             variant="outline"
                                             size="sm"
                                             onClick={handleReevaluate}
-                                            disabled={isSaving}
-                                            className="text-xs hover:bg-purple-50"
+                                            isLoading={isSaving}
                                         >
-                                            ⚡ Re-Evaluate
+                                            <Zap className="h-3.5 w-3.5" />
+                                            Re-evaluate
                                         </Button>
                                     </div>
                                 </div>
 
                                 {saveSuccess && (
-                                    <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg text-sm font-medium">
-                                        ✓ evaluation scores & feedback saved successfully!
-                                    </div>
+                                    <Alert variant="success">
+                                        <span className="inline-flex items-center gap-1.5">
+                                            <CheckCircle2 className="h-4 w-4" />
+                                            Evaluation saved and released to the student.
+                                        </span>
+                                    </Alert>
                                 )}
 
                                 {showSourceCode ? (
-                                    /* Source / Extracted Document Inspector */
                                     <div className="space-y-3">
-                                        <h3 className="text-sm font-bold text-foreground">Extracted File Content</h3>
+                                        <h3 className="text-sm font-bold text-foreground">Extracted file content</h3>
                                         {selectedSubmission.extracted_text || selectedSubmission.extracted_code ? (
                                             <pre className="p-4 bg-slate-950 text-slate-100 rounded-xl overflow-x-auto text-xs font-mono whitespace-pre-wrap max-h-[500px]">
                                                 {selectedSubmission.extracted_code || selectedSubmission.extracted_text}
                                             </pre>
                                         ) : (
-                                            <p className="text-sm text-muted-foreground italic p-4 border rounded-lg">
+                                            <p className="text-sm text-muted-foreground italic p-4 border border-border rounded-lg">
                                                 No extracted text found for this submission.
                                             </p>
                                         )}
                                     </div>
                                 ) : selectedSubmission.evaluation ? (
-                                    /* Evaluation Score Override & Feedback Editor */
                                     <div className="space-y-6">
-                                        {/* Score Summary Box */}
                                         <div className="flex justify-between items-center bg-purple-50 dark:bg-purple-950/30 p-4 rounded-xl border border-purple-100 dark:border-purple-900/40">
                                             <div>
-                                                <p className="text-xs font-semibold text-muted-foreground uppercase">Current Score</p>
+                                                <p className="text-xs font-semibold text-muted-foreground uppercase">Current score</p>
                                                 <div className="flex items-baseline gap-2 mt-0.5">
                                                     <span className="text-4xl font-black text-purple-700 dark:text-purple-300">
                                                         {selectedSubmission.evaluation.total_score?.toFixed(1)}
                                                     </span>
-                                                    <span className="text-sm font-semibold text-muted-foreground">/ 100</span>
+                                                    <span className="text-sm font-semibold text-muted-foreground">/ {selectedSubmission.assignment?.max_score ?? 100}</span>
                                                 </div>
                                             </div>
-
                                             <div className="text-right">
-                                                <p className="text-xs font-semibold text-muted-foreground uppercase">AI Confidence</p>
+                                                <p className="text-xs font-semibold text-muted-foreground uppercase">AI confidence</p>
                                                 <p className="text-xl font-bold text-emerald-600 dark:text-emerald-400 mt-0.5">
                                                     {(selectedSubmission.evaluation.ai_confidence * 100).toFixed(0)}%
                                                 </p>
                                             </div>
                                         </div>
 
-                                        {/* Criteria Editor List */}
-                                        <div className="space-y-5">
+                                        {selectedSubmission.evaluation.is_ai_generated && (
+                                            <div className="bg-purple-50/50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-900/40 rounded-lg p-3 flex items-center gap-2">
+                                                <Sparkles className="h-4 w-4 text-purple-600 dark:text-purple-400 shrink-0" />
+                                                <p className="text-sm text-purple-900 dark:text-purple-100">
+                                                    This evaluation was generated by AI. You can review and override scores below.
+                                                </p>
+                                            </div>
+                                        )}
+
+                                        <ClassificationBadges
+                                            contentType={selectedSubmission.evaluation.content_type}
+                                            domain={selectedSubmission.evaluation.domain}
+                                            complexity={selectedSubmission.evaluation.complexity}
+                                        />
+
+                                        <VisualContentWarning
+                                            hasUngragedVisualContent={selectedSubmission.evaluation.has_ungraded_visual_content}
+                                        />
+
+                                        <IssuesPanel issues={selectedSubmission.evaluation.issues} />
+
+                                        <div className="space-y-3">
                                             <div className="flex justify-between items-center">
                                                 <h3 className="text-sm font-bold text-foreground uppercase tracking-wide">
-                                                    Teacher Score & Feedback Overrides
+                                                    Scores &amp; feedback
                                                 </h3>
-                                                <span className="text-xs text-muted-foreground">Edit values below to override AI scores</span>
+                                                <span className="text-xs text-muted-foreground">Edit values below to override the AI</span>
                                             </div>
 
-                                            {Object.entries(editedScores).map(([criterion, score]) => (
-                                                <div key={criterion} className="p-4 rounded-xl border border-border bg-card/60 space-y-3">
-                                                    <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-2">
-                                                        <label className="font-bold text-foreground capitalize text-sm">
-                                                            {criterion.replace('_', ' ')}
-                                                        </label>
-
-                                                        <div className="flex items-center gap-3">
-                                                            <input
-                                                                type="range"
-                                                                min="0"
-                                                                max="100"
-                                                                step="1"
-                                                                value={score}
-                                                                onChange={(e) => handleScoreChange(criterion, parseFloat(e.target.value))}
-                                                                className="w-32 accent-purple-600"
-                                                            />
-                                                            <div className="flex items-center gap-1">
-                                                                <input
-                                                                    type="number"
-                                                                    min="0"
-                                                                    max="100"
-                                                                    value={score}
-                                                                    onChange={(e) => handleScoreChange(criterion, parseFloat(e.target.value) || 0)}
-                                                                    className="w-16 h-8 text-xs font-bold text-center border rounded-md bg-background"
-                                                                />
-                                                                <span className="text-xs text-muted-foreground">/100</span>
-                                                            </div>
-                                                        </div>
-                                                    </div>
-
-                                                    {/* Editable Feedback */}
-                                                    <div>
-                                                        <span className="text-xs font-medium text-muted-foreground block mb-1">Feedback Text:</span>
-                                                        <textarea
-                                                            rows={2}
-                                                            value={editedFeedback[criterion] || ''}
-                                                            onChange={(e) => handleFeedbackChange(criterion, e.target.value)}
-                                                            className="w-full text-xs p-2.5 rounded-lg border border-input bg-background focus:outline-none focus:ring-2 focus:ring-purple-500"
-                                                        />
-                                                    </div>
-                                                </div>
-                                            ))}
+                                            <EvaluationCriteria
+                                                scores={editedScores}
+                                                feedback={editedFeedback}
+                                                maxPoints={Object.fromEntries((selectedSubmission.assignment?.rubric ?? []).map((item) => [item.key, item.max_points]))}
+                                                accent="purple"
+                                                editable
+                                                onScoreChange={handleScoreChange}
+                                                onFeedbackChange={handleFeedbackChange}
+                                            />
                                         </div>
 
-                                        {/* Action Bar */}
-                                        <div className="pt-4 border-t border-border flex justify-end gap-3">
-                                            <Button
-                                                onClick={handleSaveAndApprove}
-                                                disabled={isSaving}
-                                                size="lg"
-                                                className="bg-purple-600 hover:bg-purple-700 text-white font-bold shadow-md w-full sm:w-auto"
-                                            >
-                                                {isSaving ? 'Saving...' : '✓ Approve & Release Score to Student'}
+                                        <div className="pt-4 border-t border-border flex justify-end">
+                                            <Button onClick={handleSaveAndApprove} isLoading={isSaving} size="lg" className="w-full sm:w-auto">
+                                                <CheckCircle2 className="h-4 w-4" />
+                                                {isSaving ? 'Saving…' : 'Approve & release to student'}
                                             </Button>
                                         </div>
                                     </div>
                                 ) : (
-                                    <p className="text-muted-foreground text-center p-8">No evaluation available for this submission.</p>
+                                    <EmptyState title="No evaluation available" description="This submission hasn't been evaluated yet." />
                                 )}
                             </Card>
                         ) : (
-                            <Card className="p-12 text-center text-muted-foreground">
-                                Select a submission from the left queue to view and edit its evaluation.
+                            <Card>
+                                <EmptyState title="Select a submission" description="Choose a submission from the queue on the left to review it." />
                             </Card>
                         )}
                     </div>
                 </div>
             </main>
+
+            <Modal open={showAssignmentModal} onClose={() => setShowAssignmentModal(false)} title={editingAssignment ? 'Edit assignment' : 'Create assignment'} widthClassName="max-w-2xl">
+                <form onSubmit={saveAssignment} className="p-6 space-y-4">
+                    {assignmentError && <Alert variant="error">{assignmentError}</Alert>}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <FormField label="Subject name" htmlFor="subject-name"><Input id="subject-name" value={assignmentForm.subject_name} onChange={(e) => setAssignmentForm({ ...assignmentForm, subject_name: e.target.value })} /></FormField>
+                        <FormField label="Subject code" htmlFor="subject-code"><Input id="subject-code" value={assignmentForm.subject_code} onChange={(e) => setAssignmentForm({ ...assignmentForm, subject_code: e.target.value })} /></FormField>
+                    </div>
+                    <FormField label="Title" htmlFor="assignment-title"><Input id="assignment-title" value={assignmentForm.title} onChange={(e) => setAssignmentForm({ ...assignmentForm, title: e.target.value })} /></FormField>
+                    <FormField label="Instructions" htmlFor="assignment-description"><Textarea id="assignment-description" value={assignmentForm.description} onChange={(e) => setAssignmentForm({ ...assignmentForm, description: e.target.value })} /></FormField>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <FormField label="Due date" htmlFor="assignment-due"><Input id="assignment-due" type="datetime-local" value={assignmentForm.due_date} onChange={(e) => setAssignmentForm({ ...assignmentForm, due_date: e.target.value })} /></FormField>
+                        <FormField label="Max score" htmlFor="assignment-score"><Input id="assignment-score" type="number" min="1" value={assignmentForm.max_score} onChange={(e) => setAssignmentForm({ ...assignmentForm, max_score: e.target.value })} /></FormField>
+                    </div>
+                    <fieldset className="space-y-3">
+                        <div className="flex items-center justify-between gap-3">
+                            <legend className="block text-sm font-medium text-foreground">Rubric criteria</legend>
+                            <span className="text-xs text-muted-foreground">{assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0)} / {assignmentForm.max_score || 0} points</span>
+                        </div>
+                        {assignmentForm.rubric.map((criterion, index) => (
+                            <div key={index} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_8rem_auto] gap-2 items-end">
+                                <FormField label="Label" htmlFor={`rubric-label-${index}`}><Input id={`rubric-label-${index}`} value={criterion.label} onChange={(e) => setAssignmentForm((prev) => ({ ...prev, rubric: prev.rubric.map((item, itemIndex) => itemIndex === index ? { ...item, label: e.target.value } : item) }))} /></FormField>
+                                <FormField label="Description" htmlFor={`rubric-description-${index}`}><Input id={`rubric-description-${index}`} value={criterion.description ?? ''} onChange={(e) => setAssignmentForm((prev) => ({ ...prev, rubric: prev.rubric.map((item, itemIndex) => itemIndex === index ? { ...item, description: e.target.value } : item) }))} /></FormField>
+                                <FormField label="Max points" htmlFor={`rubric-points-${index}`}><Input id={`rubric-points-${index}`} type="number" min="1" value={criterion.max_points} onChange={(e) => setAssignmentForm((prev) => ({ ...prev, rubric: prev.rubric.map((item, itemIndex) => itemIndex === index ? { ...item, max_points: Number(e.target.value) || 0 } : item) }))} /></FormField>
+                                <Button type="button" variant="ghost" size="icon" title="Remove criterion" disabled={assignmentForm.rubric.length === 1} onClick={() => setAssignmentForm((prev) => ({ ...prev, rubric: prev.rubric.filter((_, itemIndex) => itemIndex !== index) }))}><Trash2 className="h-4 w-4 text-red-600" /></Button>
+                            </div>
+                        ))}
+                        {assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0) !== Number(assignmentForm.max_score) && <Alert variant="warning">Rubric points must equal the assignment max score before it can be saved.</Alert>}
+                        <Button type="button" variant="outline" size="sm" onClick={() => setAssignmentForm((prev) => ({ ...prev, rubric: [...prev.rubric, { key: '', label: '', description: '', max_points: 0 }] }))}><Plus className="h-4 w-4" />Add criterion</Button>
+                    </fieldset>
+                    <fieldset><legend className="block text-sm font-medium text-foreground mb-1.5">Allowed file types</legend><div className="flex flex-wrap gap-4">{['pdf', 'docx', 'txt', 'code', 'image'].map((type) => <label key={type} className="flex items-center gap-2 text-sm text-foreground"><input type="checkbox" checked={assignmentForm.allowed_file_types.includes(type)} onChange={(e) => setAssignmentForm({ ...assignmentForm, allowed_file_types: e.target.checked ? [...assignmentForm.allowed_file_types, type] : assignmentForm.allowed_file_types.filter((item) => item !== type) })} />{type.toUpperCase()}</label>)}</div></fieldset>
+                    <div className="flex justify-end gap-2 pt-2"><Button type="button" variant="outline" onClick={() => setShowAssignmentModal(false)}>Cancel</Button><Button type="submit" disabled={assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0) !== Number(assignmentForm.max_score) || assignmentForm.rubric.some((criterion) => !criterion.label.trim())}>{editingAssignment ? 'Save changes' : 'Create assignment'}</Button></div>
+                </form>
+            </Modal>
         </div>
     );
 }

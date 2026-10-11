@@ -30,18 +30,26 @@ export const authAPI = {
         apiClient.get('/auth/me'),
 };
 
+// Assignments API
+export const assignmentsAPI = {
+    list: () => apiClient.get('/assignments'),
+    create: (payload: Record<string, unknown>) => apiClient.post('/assignments', payload),
+    update: (id: number, payload: Record<string, unknown>) => apiClient.patch(`/assignments/${id}`, payload),
+    remove: (id: number) => apiClient.delete(`/assignments/${id}`),
+};
+
 // Submissions API
 export const submissionsAPI = {
-    upload: (file: File, assignmentId: string) => {
+    upload: (file: File, assignmentId: number) => {
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('assignment_id', assignmentId);
+        formData.append('assignment_id', assignmentId.toString());
         return apiClient.post('/submissions/upload', formData, {
             headers: { 'Content-Type': 'multipart/form-data' },
         });
     },
 
-    evaluate: (submissionId: number, rubricId: number = 1, useMockLLM: boolean = true) =>
+    evaluate: (submissionId: number, rubricId?: number, useMockLLM: boolean = true) =>
         apiClient.post(`/submissions/evaluate/${submissionId}`, null, {
             params: { rubric_id: rubricId, use_mock_llm: useMockLLM },
         }),

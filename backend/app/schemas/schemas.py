@@ -48,15 +48,68 @@ class TokenResponse(BaseModel):
     user: UserResponse
 
 
+# Assignment Schemas
+class RubricCriterion(BaseModel):
+    key: Optional[str] = None
+    label: str
+    description: Optional[str] = None
+    max_points: float
+
+
+class AssignmentCreate(BaseModel):
+    subject_name: str
+    subject_code: str
+    title: str
+    description: Optional[str] = None
+    due_date: Optional[datetime] = None
+    max_score: float = 100
+    allowed_file_types: List[str]
+    rubric: List[RubricCriterion] = []
+    is_active: bool = True
+
+
+class AssignmentUpdate(BaseModel):
+    subject_name: Optional[str] = None
+    subject_code: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    due_date: Optional[datetime] = None
+    max_score: Optional[float] = None
+    allowed_file_types: Optional[List[str]] = None
+    rubric: Optional[List[RubricCriterion]] = None
+    is_active: Optional[bool] = None
+
+
+class AssignmentResponse(BaseModel):
+    id: int
+    teacher_id: int
+    subject_name: str
+    subject_code: str
+    title: str
+    description: Optional[str] = None
+    due_date: Optional[datetime] = None
+    max_score: float
+    allowed_file_types: List[str]
+    rubric: List[RubricCriterion]
+    is_active: bool
+    submission_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # Submission Schemas
 class SubmissionCreate(BaseModel):
-    assignment_id: str
+    assignment_id: int
 
 
 class SubmissionResponse(BaseModel):
     id: int
     student_id: int
-    assignment_id: str
+    assignment_id: int
+    assignment: Optional[AssignmentResponse] = None
     file_path: str
     file_type: str
     status: SubmissionStatus

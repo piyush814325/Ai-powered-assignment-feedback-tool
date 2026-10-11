@@ -1,78 +1,134 @@
 @import "tailwindcss";
 
-@layer base {
-  :root {
-    --background: 203 52% 98%;
-    /* Soft off-white background #F8FAFC */
-    --foreground: 222 47% 11%;
-    /* Dark slate text #0F172A */
-    --card: 0 0% 100%;
-    /* White card surface */
+/*
+ * Tailwind v4 dark mode strategy: apply dark styles when the element is
+ * inside (or is) an element with the `.dark` class, instead of the default
+ * `prefers-color-scheme` media query. This is what makes ThemeToggle's
+ * `document.documentElement.classList.toggle('dark', ...)` actually work.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Maps CSS custom properties to Tailwind's color namespace, so
+ * `bg-background`, `text-foreground`, `border-border`, `ring-ring`, etc.
+ * exist as utilities at all. `@theme inline` (rather than a plain
+ * `@theme`) means each utility re-reads the variable at usage time, which
+ * is required here since :root vs .dark assign different values to the
+ * same variable name.
+ */
+@theme inline {
+    --color-background: hsl(var(--background));
+    --color-foreground: hsl(var(--foreground));
+
+    --color-card: hsl(var(--card));
+    --color-card-foreground: hsl(var(--card-foreground));
+
+    --color-popover: hsl(var(--popover));
+    --color-popover-foreground: hsl(var(--popover-foreground));
+
+    --color-primary: hsl(var(--primary));
+    --color-primary-foreground: hsl(var(--primary-foreground));
+
+    --color-secondary: hsl(var(--secondary));
+    --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+    --color-muted: hsl(var(--muted));
+    --color-muted-foreground: hsl(var(--muted-foreground));
+
+    --color-accent: hsl(var(--accent));
+    --color-accent-foreground: hsl(var(--accent-foreground));
+
+    --color-destructive: hsl(var(--destructive));
+    --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+    --color-border: hsl(var(--border));
+    --color-input: hsl(var(--input));
+    --color-ring: hsl(var(--ring));
+
+    --radius-lg: var(--radius);
+    --radius-md: calc(var(--radius) - 2px);
+    --radius-sm: calc(var(--radius) - 4px);
+}
+
+/*
+ * Actual token values, per theme. Every variable referenced above must be
+ * defined in BOTH blocks or its utility renders as transparent/invisible.
+ */
+:root {
+    --background: 210 40% 98%;         /* slate-50   page background */
+    --foreground: 222 47% 11%;         /* slate-900  primary text */
+
+    --card: 0 0% 100%;                 /* white      raised surfaces */
     --card-foreground: 222 47% 11%;
-    /* Dark slate card text */
+
     --popover: 0 0% 100%;
     --popover-foreground: 222 47% 11%;
-    --muted: 210 16% 97%;
-    /* Soft gray surface */
-    --muted-foreground: 214 11% 35%;
-    /* Medium slate text */
-    --accent: 240 65% 59%;
-    /* Deep indigo accent #4F46E5 */
-    --accent-foreground: 0 0% 100%;
-    --destructive: 346 84% 61%;
-    --destructive-foreground: 0 0% 100%;
-    --border: 210 44% 90%;
-    /* Soft gray border #E2E8F0 */
-    --input: 0 0% 100%;
-    --primary: 240 65% 59%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 0 0% 100%;
-    --secondary-foreground: 222 47% 11%;
-    --ring: 240 65% 59%;
-    --radius: 0.75rem;
-  }
 
-  .dark {
-    --background: 228 86% 4%;
-    /* Deep obsidian slate #090D16 */
-    --foreground: 210 40% 98%;
-    /* Crisp off-white text #F8FAFC */
-    --card: 228 24% 8%;
-    /* Dark slate surface */
+    --primary: 243 75% 59%;            /* indigo-600 brand / CTAs */
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 210 40% 96%;          /* slate-100  quiet surfaces */
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;   /* slate-500  secondary text */
+
+    --accent: 210 40% 94%;             /* neutral hover surface, not a brand color */
+    --accent-foreground: 222 47% 11%;
+
+    --destructive: 0 72% 51%;          /* red-600 */
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 214 32% 88%;             /* slate-200 */
+    --input: 214 32% 88%;
+    --ring: 243 75% 59%;               /* indigo-600 focus ring */
+
+    --radius: 0.625rem;
+    color-scheme: light;
+}
+
+.dark {
+    --background: 222 47% 9%;          /* slate-900/950 page background */
+    --foreground: 210 40% 98%;         /* near-white primary text */
+
+    --card: 217 33% 15%;               /* slate-800, lifted above the page */
     --card-foreground: 210 40% 98%;
-    /* Crisp off-white card text */
-    --popover: 228 24% 10%;
+
+    --popover: 217 33% 15%;
     --popover-foreground: 210 40% 98%;
-    --muted: 228 35% 13%;
-    /* Subtle dark surface */
-    --muted-foreground: 210 40% 82%;
-    /* Soft off-white muted text */
-    --accent: 237 75% 64%;
-    /* Vibrant neon indigo #6366F1 */
-    --accent-foreground: 0 0% 100%;
-    --destructive: 346 84% 61%;
-    --destructive-foreground: 0 0% 100%;
-    --border: 214 30% 12%;
-    /* Subtle border #1E293B */
-    --input: 228 24% 10%;
-    --primary: 237 75% 64%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 228 24% 10%;
+
+    --primary: 234 89% 74%;            /* indigo-400, brighter for dark backgrounds */
+    --primary-foreground: 222 47% 11%;
+
+    --secondary: 217 33% 18%;          /* slate-800 */
     --secondary-foreground: 210 40% 98%;
-    --ring: 237 75% 64%;
-  }
+
+    --muted: 217 33% 18%;
+    --muted-foreground: 215 20% 68%;   /* slate-400 */
+
+    --accent: 215 25% 24%;             /* slate-700, visible hover surface on dark cards */
+    --accent-foreground: 210 40% 98%;
+
+    --destructive: 0 70% 63%;          /* red-400, keeps contrast on dark bg */
+    --destructive-foreground: 222 47% 11%;
+
+    --border: 215 25% 24%;             /* slate-700, visible against slate-800/900 */
+    --input: 215 25% 24%;
+    --ring: 234 89% 74%;               /* indigo-400 focus ring */
+
+    color-scheme: dark;
 }
 
 @layer base {
-  * {
-    border-color: hsl(var(--border));
-  }
+    * {
+        @apply border-border;
+    }
 
-  body {
-    background-color: hsl(var(--background));
-    color: hsl(var(--foreground));
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-    min-height: 100vh;
-    transition: background-color 0.2s ease, color 0.2s ease;
-  }
+    body {
+        @apply bg-background text-foreground antialiased;
+    }
+
+    :focus-visible {
+        @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+    }
 }
