@@ -87,15 +87,15 @@ def migrate_legacy_submission_assignments(bind) -> None:
             submission.assignment_id = assignment.id
 
         session.commit()
-        if bind.dialect.name == "mysql":
+        if bind.dialect.name in ("mysql", "postgresql"):
             with bind.begin() as connection:
-                connection.execute(text("ALTER TABLE submissions MODIFY assignment_id INTEGER NOT NULL"))
+                if bind.dialect.name == "mysql":
+                    connection.execute(text("ALTER TABLE submissions MODIFY assignment_id INTEGER NOT NULL"))
+                else:
+                    connection.execute(text("ALTER TABLE submissions ALTER COLUMN assignment_id SET NOT NULL"))
+                    connection.execute(text("ALTER TABLE submissions ALTER COLUMN assignment_id TYPE INTEGER USING assignment_id::integer"))
                 foreign_keys = inspect(bind).get_foreign_keys("submissions")
                 if not any(fk.get("name") == "fk_submissions_assignment_id" for fk in foreign_keys):
-                    connection.execute(text(
-                        "ALTER TABLE submissions ADD CONSTRAINT fk_submissions_assignment_id "
-                        "FOREIGN KEY (assignment_id) REFERENCES assignments(id)"
-                    ))
                     connection.execute(text(
                         "ALTER TABLE submissions ADD CONSTRAINT fk_submissions_assignment_id "
                         "FOREIGN KEY (assignment_id) REFERENCES assignments(id)"
@@ -140,8 +140,7 @@ def migrate_evaluation_two_stage_fields(bind) -> None:
             if col_name not in columns:
                 if bind.dialect.name == "sqlite":
                     connection.execute(text(f"ALTER TABLE evaluations ADD COLUMN {col_name} {col_type}"))
-                elif bind.dialect.name == "mysql":
-                    # MySQL: add nullable columns with appropriate defaults
+                elif bind.dialect.name in ("mysql", "postgresql"):
                     if col_name == "has_ungraded_visual_content":
                         connection.execute(text(f"ALTER TABLE evaluations ADD COLUMN {col_name} {col_type} DEFAULT FALSE"))
                     else:
