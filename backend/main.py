@@ -1,16 +1,20 @@
-from fastapi import FastAPI
+import logging
+import os
+
+import httpx
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from app.routers import assignments, auth, submissions
 from app.database import Base, engine, SessionLocal
 from app.models import Rubric
-from app.migration import migrate_legacy_submission_assignments, migrate_assignment_rubrics, migrate_evaluation_two_stage_fields
+from app.services.groq_models import ModelCategory, get_model
+from app.migration import run_migrations
 import app.models  # Import models so they register with Base.metadata
 
-# Create tables in database if they don't exist
-Base.metadata.create_all(bind=engine)
-migrate_legacy_submission_assignments(engine)
-migrate_assignment_rubrics(engine)
-migrate_evaluation_two_stage_fields(engine)
+logger = logging.getLogger(__name__)
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
 def seed_default_rubric():
     db = SessionLocal()
@@ -35,19 +39,116 @@ def seed_default_rubric():
             )
             db.add(default_rubric)
             db.commit()
-    except Exception as err:
-        print("Rubric seed info:", err)
+    except Exception:
         db.rollback()
+        raise
     finally:
         db.close()
 
-seed_default_rubric()
-
 app = FastAPI(title="AI Assignment Feedback Tool", version="0.1.0")
+_groq_models_checked = False
+
+
+@app.on_event("startup")
+def initialize_database() -> None:
+    if not os.getenv("JWT_SECRET", "").strip():
+        raise RuntimeError("JWT_SECRET must be configured in the environment")
+    missing_storage_settings = [
+        setting
+        for setting in (
+            "SUPABASE_URL",
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "SUPABASE_BUCKET",
+        )
+        if not os.getenv(setting, "").strip()
+    ]
+    if missing_storage_settings:
+        raise RuntimeError(
+            "Supabase Storage settings are required: "
+            + ", ".join(missing_storage_settings)
+        )
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        Base.metadata.create_all(bind=engine)
+        run_migrations(engine)
+        seed_default_rubric()
+    except SQLAlchemyError as error:
+        logger.error(
+            "Database startup failed: exception_type=%s; check DATABASE_URL and Supabase availability",
+            type(error).__name__,
+        )
+        raise RuntimeError(
+            "Unable to connect to or initialize the Supabase PostgreSQL database"
+        ) from None
+
+
+@app.on_event("startup")
+async def log_groq_configuration() -> None:
+    global _groq_models_checked
+    api_key = os.getenv("GROQ_API_KEY", "")
+    categories = {
+        "classify": ModelCategory.CLASSIFY,
+        "verify": ModelCategory.VERIFY,
+        "grade_fast": ModelCategory.GRADE_FAST,
+        "grade_reasoning": ModelCategory.GRADE_REASONING,
+    }
+    configured_models = {}
+    for category, model_category in categories.items():
+        try:
+            configured_models[category] = get_model(model_category)
+        except ValueError:
+            configured_models[category] = "<not configured>"
+    logger.info(
+        "Groq configuration: GROQ_API_KEY loaded=%s; models=%s",
+        bool(api_key),
+        configured_models,
+    )
+    if not api_key or _groq_models_checked:
+        return
+
+    _groq_models_checked = True
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                GROQ_MODELS_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            response.raise_for_status()
+            active_models = {
+                entry.get("id")
+                for entry in response.json().get("data", [])
+                if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+            }
+        for category, model_id in configured_models.items():
+            if model_id not in active_models:
+                logger.warning(
+                    "Configured Groq model is not listed as active: category=%s model_id=%s",
+                    category,
+                    model_id,
+                )
+    except Exception as error:
+        status_code = (
+            error.response.status_code
+            if isinstance(error, httpx.HTTPStatusError)
+            else None
+        )
+        logger.warning(
+            "Groq models list check failed: exception_type=%s http_status=%s",
+            type(error).__name__,
+            status_code,
+        )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,4 +160,10 @@ app.include_router(submissions.router)
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except SQLAlchemyError as error:
+        logger.error("Database health check failed: exception_type=%s", type(error).__name__)
+        raise HTTPException(status_code=503, detail="Database unavailable") from None
+    return {"status": "ok", "database": "connected"}

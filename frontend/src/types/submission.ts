@@ -32,10 +32,38 @@ export interface Submission {
     assignment_id: number;
     assignment?: Assignment;
     file_path: string;
+    original_filename?: string | null;
     file_type: string;
     status: string;
     extracted_text?: string;
     extracted_code?: string;
+    content_hash?: string;
+    verification_verdict?: string;
+    verification_confidence?: number | null;
+    verification_detected_topic?: string | null;
+    verification_expected_topic?: string | null;
+    verification_reasons?: string[] | null;
+    verification_missing_requirements?: string[] | null;
+    verification_model?: string | null;
+    verification_error_code?: string | null;
+    teacher_override?: boolean;
+    teacher_override_by?: number | null;
+    teacher_override_at?: string | null;
+    teacher_override_reason?: string | null;
     created_at: string;
     evaluation?: Evaluation;
+}
+
+export interface SubmissionEvaluationResult {
+    submission_id: number;
+    status: string;
+    evaluation?: Evaluation | null;
+    verification_verdict?: string | null;
+    verification_confidence?: number | null;
+    verification_detected_topic?: string | null;
+    verification_expected_topic?: string | null;
+    verification_reasons?: string[] | null;
+    verification_missing_requirements?: string[] | null;
+    verification_model?: string | null;
+    verification_error_code?: string | null;
 }

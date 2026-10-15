@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 from typing import List
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -91,6 +92,7 @@ def create_assignment(
 
 @router.get("", response_model=List[AssignmentResponse])
 def list_assignments(
+    search: str | None = Query(default=None, min_length=1, max_length=255),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -99,6 +101,15 @@ def list_assignments(
         query = query.filter(Assignment.teacher_id == current_user.id)
     else:
         query = query.filter(Assignment.is_active.is_(True))
+    if search:
+        term = f"%{search.lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(Assignment.subject_name).like(term),
+                func.lower(Assignment.subject_code).like(term),
+                func.lower(Assignment.title).like(term),
+            )
+        )
     assignments = query.order_by(Assignment.due_date.is_(None), Assignment.due_date, Assignment.created_at.desc()).all()
     return [assignment_response(assignment) for assignment in assignments]
 
@@ -141,8 +152,8 @@ def update_assignment(
     return assignment_response(assignment)
 
 
-@router.delete("/{assignment_id}", response_model=AssignmentResponse)
-def deactivate_assignment(
+@router.delete("/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_assignment(
     assignment_id: int,
     teacher: User = Depends(require_teacher),
     db: Session = Depends(get_db),
@@ -153,7 +164,11 @@ def deactivate_assignment(
     ).first()
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
-    assignment.is_active = False
+    if assignment.submissions:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Assignments with submissions cannot be deleted; deactivate the assignment instead.",
+        )
+    db.delete(assignment)
     db.commit()
-    db.refresh(assignment)
-    return assignment_response(assignment)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

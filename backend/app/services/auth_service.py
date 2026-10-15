@@ -7,9 +7,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+
+def _secret_key() -> str:
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET must be configured in the environment")
+    return JWT_SECRET
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -36,13 +42,13 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     else:
         expire = now + timedelta(minutes=15)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, _secret_key(), algorithm=ALGORITHM)
     return encoded_jwt
 
 
-def decode_token(token: str) -> dict:
+def decode_token(token: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, _secret_key(), algorithms=[ALGORITHM])
         return payload
     except JWTError:
         return None

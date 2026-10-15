@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from datetime import timedelta
 from app.database import get_db
 from app.schemas.schemas import UserCreate, UserLogin, UserResponse, TokenResponse
@@ -16,7 +17,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 @router.post("/register", response_model=UserResponse)
 def register(user: UserCreate, db: Session = Depends(get_db)):
     # Check if user exists
-    existing_user = db.query(User).filter(User.email == user.email).first()
+    normalized_email = str(user.email).lower()
+    existing_user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -26,7 +28,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     # Create new user
     hashed_password = get_password_hash(user.password)
     new_user = User(
-        email=user.email,
+        email=normalized_email,
         full_name=user.full_name,
         hashed_password=hashed_password,
         role=user.role
@@ -40,7 +42,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 @router.post("/login", response_model=TokenResponse)
 def login(user: UserLogin, db: Session = Depends(get_db)):
     # Find user
-    db_user = db.query(User).filter(User.email == user.email).first()
+    db_user = db.query(User).filter(func.lower(User.email) == str(user.email).lower()).first()
     if not db_user or not verify_password(user.password, db_user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -80,7 +82,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         )
     
     email = payload.get("sub")
-    user = db.query(User).filter(User.email == email).first()
+    user = db.query(User).filter(func.lower(User.email) == str(email).lower()).first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

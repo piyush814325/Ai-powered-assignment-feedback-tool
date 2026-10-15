@@ -1,150 +1,152 @@
-from datetime import datetime, timezone
+from sqlalchemy import Column, inspect, text
+from sqlalchemy.schema import CreateColumn
 
-from sqlalchemy import inspect, text
-from sqlalchemy.orm import Session
-
-from app.models import Assignment, Submission, User, UserRole
-
-
-LEGACY_RUBRIC = [
-    {"key": "clarity", "label": "Clarity", "description": "Clear and understandable", "max_points": 15},
-    {"key": "completeness", "label": "Completeness", "description": "All requirements met", "max_points": 20},
-    {"key": "code_quality", "label": "Code Quality", "description": "Well-written code", "max_points": 15},
-    {"key": "correctness", "label": "Correctness", "description": "Correct solution", "max_points": 25},
-    {"key": "documentation", "label": "Documentation", "description": "Well-documented", "max_points": 10},
-    {"key": "organization", "label": "Organization", "description": "Well-organized", "max_points": 10},
-    {"key": "originality", "label": "Originality", "description": "Original work", "max_points": 5},
-]
+from app.database import Base
+import app.models
 
 
-def migrate_assignment_rubrics(bind) -> None:
-    """Add assignment rubrics and preserve legacy assignments."""
-    inspector = inspect(bind)
-    if "assignments" not in inspector.get_table_names():
-        return
-    columns = {column["name"] for column in inspector.get_columns("assignments")}
-    if "rubric" not in columns:
-        with bind.begin() as connection:
-            if bind.dialect.name == "sqlite":
-                connection.execute(text("ALTER TABLE assignments ADD COLUMN rubric JSON"))
-            else:
-                connection.execute(text("ALTER TABLE assignments ADD COLUMN rubric JSON NULL"))
-    session = Session(bind=bind)
-    try:
-        for assignment in session.query(Assignment).filter(Assignment.rubric.is_(None)).all():
-            assignment.rubric = LEGACY_RUBRIC
-        session.commit()
-    finally:
-        session.close()
+def _ensure_model_columns(engine) -> None:
+    inspector = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            continue
+        existing = {column["name"] for column in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            additive_column = Column(
+                column.name,
+                column.type,
+                nullable=True,
+                server_default=column.server_default,
+            )
+            ddl = CreateColumn(additive_column).compile(dialect=engine.dialect)
+            quoted_table = engine.dialect.identifier_preparer.quote(table.name)
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f"ALTER TABLE {quoted_table} ADD COLUMN {ddl}")
 
 
-def migrate_legacy_submission_assignments(bind) -> None:
-    """Preserve pre-assignment submissions when upgrading the legacy string column."""
-    inspector = inspect(bind)
-    if "submissions" not in inspector.get_table_names():
-        return
-    columns = {column["name"]: column for column in inspector.get_columns("submissions")}
-    assignment_column = columns.get("assignment_id")
-    if not assignment_column or assignment_column["type"].__class__.__name__.lower() not in {"varchar", "string"}:
-        return
+def _convert_legacy_types(engine) -> None:
+    inspector = inspect(engine)
+    preparer = engine.dialect.identifier_preparer
+    for table_name, column_name, length in (
+        ("users", "role", 7),
+        ("submissions", "status", 15),
+    ):
+        if not inspector.has_table(table_name):
+            continue
+        column = next(
+            (item for item in inspector.get_columns(table_name) if item["name"] == column_name),
+            None,
+        )
+        if column and column["type"].__class__.__name__.lower() == "enum":
+            table = preparer.quote(table_name)
+            name = preparer.quote(column_name)
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f"ALTER TABLE {table} ALTER COLUMN {name} DROP DEFAULT")
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table} ALTER COLUMN {name} TYPE VARCHAR({length}) "
+                    f"USING {name}::text"
+                )
 
-    session = Session(bind=bind)
-    try:
-        legacy_submissions = session.query(Submission).all()
-        if not legacy_submissions:
-            return
-
-        teacher = session.query(User).filter(User.role == UserRole.TEACHER).first()
-        if not teacher:
-            teacher = session.query(User).first()
-        if not teacher:
-            raise RuntimeError("Cannot migrate legacy submissions until at least one user exists")
-
-        assignments_by_legacy_id = {}
-        for submission in legacy_submissions:
-            legacy_id = (submission.assignment_id or "").strip() or f"legacy-submission-{submission.id}"
-            assignment = assignments_by_legacy_id.get(legacy_id)
-            if assignment is None:
-                assignment = session.query(Assignment).filter(
-                    Assignment.teacher_id == teacher.id,
-                    Assignment.title == f"Legacy assignment: {legacy_id}",
-                ).first()
-                if assignment is None:
-                    assignment = Assignment(
-                        teacher_id=teacher.id,
-                        subject_name="Legacy submissions",
-                        subject_code="LEGACY",
-                        title=f"Legacy assignment: {legacy_id}",
-                        description="Migrated from the pre-assignment submission record.",
-                        due_date=None,
-                        max_score=100,
-                        allowed_file_types=["pdf", "docx", "txt", "code", "image"],
-                        is_active=False,
+    for table_name, column_names in (
+        ("assignments", ["allowed_file_types", "rubric"]),
+        ("submissions", ["verification_reasons", "verification_missing_requirements"]),
+        ("evaluations", ["scores", "feedback", "evidence", "issues"]),
+        ("rubrics", ["criteria"]),
+    ):
+        if not inspector.has_table(table_name):
+            continue
+        for column in inspector.get_columns(table_name):
+            if column["name"] in column_names and column["type"].__class__.__name__.lower() == "json":
+                table = preparer.quote(table_name)
+                name = preparer.quote(column["name"])
+                with engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {table} ALTER COLUMN {name} TYPE JSONB USING {name}::jsonb"
                     )
-                    session.add(assignment)
-                    session.flush()
-                assignments_by_legacy_id[legacy_id] = assignment
-            submission.assignment_id = assignment.id
 
-        session.commit()
-        if bind.dialect.name in ("mysql", "postgresql"):
-            with bind.begin() as connection:
-                if bind.dialect.name == "mysql":
-                    connection.execute(text("ALTER TABLE submissions MODIFY assignment_id INTEGER NOT NULL"))
-                else:
-                    connection.execute(text("ALTER TABLE submissions ALTER COLUMN assignment_id SET NOT NULL"))
-                    connection.execute(text("ALTER TABLE submissions ALTER COLUMN assignment_id TYPE INTEGER USING assignment_id::integer"))
-                foreign_keys = inspect(bind).get_foreign_keys("submissions")
-                if not any(fk.get("name") == "fk_submissions_assignment_id" for fk in foreign_keys):
-                    connection.execute(text(
-                        "ALTER TABLE submissions ADD CONSTRAINT fk_submissions_assignment_id "
-                        "FOREIGN KEY (assignment_id) REFERENCES assignments(id)"
-                    ))
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    for table_name, column_names in (
+        ("users", ["created_at"]),
+        ("assignments", ["due_date", "created_at", "updated_at"]),
+        ("submissions", ["teacher_override_at", "created_at", "updated_at"]),
+        ("verification_attempts", ["created_at"]),
+        ("evaluations", ["created_at", "updated_at"]),
+        ("rubrics", ["created_at"]),
+        ("feedback", ["created_at"]),
+    ):
+        if not inspector.has_table(table_name):
+            continue
+        for column in inspector.get_columns(table_name):
+            if column["name"] in column_names and getattr(column["type"], "timezone", True) is False:
+                table = preparer.quote(table_name)
+                name = preparer.quote(column["name"])
+                with engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {table} ALTER COLUMN {name} "
+                        f"TYPE TIMESTAMP WITH TIME ZONE USING {name} AT TIME ZONE 'UTC'"
+                    )
 
 
-def migrate_evaluation_two_stage_fields(bind) -> None:
-    """
-    Add new columns to Evaluation table for two-stage rubric-aware grading.
-    
-    New fields:
-    - content_type: classification result (code, document_with_images, text_document, mixed)
-    - domain: inferred domain (computer_science, engineering, finance, medical, general)
-    - complexity: complexity level (simple, moderate, complex)
-    - issues: JSON array of {criterion_key?, description, severity} objects
-    - has_ungraded_visual_content: flag set when images found but not used in grading
-    - classification_model: model ID used for classification (Stage 1)
-    - grading_model: model ID used for grading (Stage 2)
-    """
-    inspector = inspect(bind)
-    if "evaluations" not in inspector.get_table_names():
+def _ensure_indexes(engine) -> None:
+    for table in Base.metadata.tables.values():
+        for index in table.indexes:
+            index.create(bind=engine, checkfirst=True)
+
+
+def _ensure_foreign_keys(engine) -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("submissions") or not inspector.has_table("users"):
         return
-    
-    columns = {column["name"] for column in inspector.get_columns("evaluations")}
-    new_columns = [
-        ("content_type", "VARCHAR(50)"),
-        ("domain", "VARCHAR(50)"),
-        ("complexity", "VARCHAR(20)"),
-        ("issues", "JSON"),
-        ("has_ungraded_visual_content", "BOOLEAN"),
-        ("classification_model", "VARCHAR(255)"),
-        ("grading_model", "VARCHAR(255)"),
-    ]
-    
-    with bind.begin() as connection:
-        for col_name, col_type in new_columns:
-            if col_name not in columns:
-                if bind.dialect.name == "sqlite":
-                    connection.execute(text(f"ALTER TABLE evaluations ADD COLUMN {col_name} {col_type}"))
-                elif bind.dialect.name in ("mysql", "postgresql"):
-                    if col_name == "has_ungraded_visual_content":
-                        connection.execute(text(f"ALTER TABLE evaluations ADD COLUMN {col_name} {col_type} DEFAULT FALSE"))
-                    else:
-                        connection.execute(text(f"ALTER TABLE evaluations ADD COLUMN {col_name} {col_type} NULL"))
-                else:
-                    connection.execute(text(f"ALTER TABLE evaluations ADD COLUMN {col_name} {col_type}"))
+    foreign_keys = inspector.get_foreign_keys("submissions")
+    has_override_reference = any(
+        foreign_key.get("constrained_columns") == ["teacher_override_by"]
+        and foreign_key.get("referred_table") == "users"
+        for foreign_key in foreign_keys
+    )
+    if not has_override_reference and "teacher_override_by" in {
+        column["name"] for column in inspector.get_columns("submissions")
+    }:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE submissions ADD CONSTRAINT "
+                "fk_submissions_teacher_override_by_users "
+                "FOREIGN KEY (teacher_override_by) REFERENCES users (id)"
+            )
 
+
+def _enable_row_level_security(engine) -> None:
+    inspector = inspect(engine)
+    preparer = engine.dialect.identifier_preparer
+    for table_name in Base.metadata.tables:
+        if inspector.has_table(table_name, schema="public"):
+            quoted_table = preparer.quote(table_name)
+            quoted_schema = preparer.quote("public")
+            with engine.begin() as connection:
+                policies = connection.execute(
+                    text(
+                        "SELECT policyname FROM pg_policies "
+                        "WHERE schemaname = 'public' AND tablename = :table_name"
+                    ),
+                    {"table_name": table_name},
+                ).scalars()
+                for policy_name in policies:
+                    quoted_policy = preparer.quote(policy_name)
+                    connection.exec_driver_sql(
+                        f"DROP POLICY IF EXISTS {quoted_policy} "
+                        f"ON {quoted_schema}.{quoted_table}"
+                    )
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {quoted_schema}.{quoted_table} ENABLE ROW LEVEL SECURITY"
+                )
+
+
+def run_migrations(engine) -> None:
+    """Apply safe, additive PostgreSQL schema updates and enable RLS."""
+    if engine.dialect.name != "postgresql":
+        raise RuntimeError("Only PostgreSQL is supported; configure the Supabase database URL")
+    _ensure_model_columns(engine)
+    _convert_legacy_types(engine)
+    _ensure_foreign_keys(engine)
+    _ensure_indexes(engine)
+    _enable_row_level_security(engine)

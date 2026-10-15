@@ -1,24 +1,30 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { submissionsAPI } from '../services/api';
 import type { Assignment } from '../types/assignment';
+import type { SubmissionEvaluationResult } from '../types/submission';
 import { Alert, Button, EmptyState, FormField, Select } from '../ui/components';
 
 interface UploadComponentProps {
     assignments: Assignment[];
-    onSuccess?: () => void;
+    onSuccess?: (closeUpload?: boolean) => void;
+    submissionToReplace?: { id: number; assignment_id: number };
 }
 
 interface ApiError {
     response?: { data?: { detail?: string } };
 }
 
-export default function UploadComponent({ assignments, onSuccess }: UploadComponentProps) {
+export default function UploadComponent({ assignments, onSuccess, submissionToReplace }: UploadComponentProps) {
     const [file, setFile] = useState<File | null>(null);
-    const [assignmentId, setAssignmentId] = useState('');
+    const [assignmentId, setAssignmentId] = useState(submissionToReplace ? String(submissionToReplace.assignment_id) : '');
     const [uploading, setUploading] = useState(false);
     const [evaluating, setEvaluating] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState(0);
     const [error, setError] = useState<string | null>(null);
     const [success, setSuccess] = useState(false);
+    const [verification, setVerification] = useState<SubmissionEvaluationResult | null>(null);
+    const [replaceSubmissionId, setReplaceSubmissionId] = useState<number | null>(submissionToReplace?.id ?? null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const selectedFile = e.target.files?.[0];
@@ -39,7 +45,20 @@ export default function UploadComponent({ assignments, onSuccess }: UploadCompon
 
             setFile(selectedFile);
             setError(null);
+            setSuccess(false);
         }
+    };
+
+    const finishEvaluation = (result: SubmissionEvaluationResult) => {
+        setVerification(result);
+        if (result.status === 'needs_attention') {
+            setSuccess(false);
+            onSuccess?.(false);
+            return;
+        }
+        setReplaceSubmissionId(null);
+        setSuccess(true);
+        setTimeout(() => onSuccess?.(), 1200);
     };
 
     const handleUpload = async (e: React.FormEvent) => {
@@ -55,43 +74,48 @@ export default function UploadComponent({ assignments, onSuccess }: UploadCompon
             return;
         }
         const assignment = assignments.find((item) => item.id === Number(assignmentId));
-        if (!assignment || (assignment.due_date && new Date(assignment.due_date) < new Date())) {
+        if (!assignment || (!replaceSubmissionId && assignment.due_date && new Date(assignment.due_date) < new Date())) {
             setError('This assignment is closed or past its due date');
             return;
         }
 
         try {
             setUploading(true);
+            setUploadProgress(0);
             setError(null);
 
-            const response = await submissionsAPI.upload(file, Number(assignmentId));
-            const newSubmissionId = response.data.id;
-
-            // Auto-start evaluation
-            await handleEvaluate(newSubmissionId);
+            setVerification(null);
+            const onUploadProgress = (progress: { loaded: number; total?: number }) => {
+                if (progress.total) {
+                    const percent = Math.min(100, Math.round((progress.loaded / progress.total) * 100));
+                    setUploadProgress(percent);
+                    if (percent === 100) {
+                        setUploading(false);
+                        setEvaluating(true);
+                    }
+                }
+            };
+            let response;
+            if (replaceSubmissionId) {
+                response = await submissionsAPI.replace(replaceSubmissionId, file, onUploadProgress);
+            } else {
+                const uploadResponse = await submissionsAPI.upload(
+                    file,
+                    Number(assignmentId),
+                    onUploadProgress,
+                );
+                setUploading(false);
+                setEvaluating(true);
+                response = await submissionsAPI.evaluate(uploadResponse.data.id, undefined, false);
+            }
+            finishEvaluation(response.data as SubmissionEvaluationResult);
 
         } catch (err) {
             const apiError = err as ApiError;
-            setError(apiError.response?.data?.detail || 'Upload failed');
-        } finally {
-            setUploading(false);
-        }
-    };
-
-    const handleEvaluate = async (id: number) => {
-        try {
-            setEvaluating(true);
-            await submissionsAPI.evaluate(id, undefined, true);
-            setSuccess(true);
-
-            setTimeout(() => {
-                if (onSuccess) onSuccess();
-            }, 2000);
-        } catch (err) {
-            const apiError = err as ApiError;
-            setError(apiError.response?.data?.detail || 'Evaluation failed');
+            setError(apiError.response?.data?.detail || (replaceSubmissionId ? 'Replacement failed' : 'Upload failed'));
         } finally {
             setEvaluating(false);
+            setUploading(false);
         }
     };
 
@@ -99,7 +123,7 @@ export default function UploadComponent({ assignments, onSuccess }: UploadCompon
         <form onSubmit={handleUpload} className="space-y-4">
             {assignments.length === 0 ? <EmptyState title="No assignments have been posted yet" /> : (
                 <FormField label="Assignment" htmlFor="assignment-select">
-                    <Select id="assignment-select" value={assignmentId} onChange={(e) => { setAssignmentId(e.target.value); setFile(null); }} required>
+                    <Select id="assignment-select" value={assignmentId} disabled={!!replaceSubmissionId} onChange={(e) => { setAssignmentId(e.target.value); setFile(null); }} required>
                         <option value="">Select an assignment</option>
                         {assignments.map((assignment) => {
                             const closed = assignment.due_date ? new Date(assignment.due_date) < new Date() : false;
@@ -130,6 +154,7 @@ export default function UploadComponent({ assignments, onSuccess }: UploadCompon
                         onChange={handleFileChange}
                         className="hidden"
                         id="file-input"
+                        ref={fileInputRef}
                         accept=".pdf,.docx,.txt,.py,.java,.cpp,.js,.ts,.png,.jpg,.jpeg"
                     />
                     <label htmlFor="file-input" className="cursor-pointer">
@@ -150,6 +175,61 @@ export default function UploadComponent({ assignments, onSuccess }: UploadCompon
 
             {error && <Alert variant="error">{error}</Alert>}
 
+            {verification?.verification_verdict === 'mismatch' && (
+                <Alert variant="error">
+                    <p className="font-bold">This file doesn&apos;t appear to match {verification.verification_expected_topic || 'the selected assignment'}.</p>
+                    {verification.verification_detected_topic && <p className="mt-1">Detected topic: {verification.verification_detected_topic}</p>}
+                    {verification.verification_expected_topic && <p>Expected topic: {verification.verification_expected_topic}</p>}
+                    {!!verification.verification_reasons?.length && (
+                        <ul className="mt-2 list-disc pl-5">{verification.verification_reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>
+                    )}
+                    <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="mt-3"
+                        onClick={() => { setReplaceSubmissionId(Number(verification.submission_id)); setFile(null); fileInputRef.current?.click(); }}
+                    >
+                        Replace file
+                    </Button>
+                </Alert>
+            )}
+            {verification?.verification_verdict === 'unreadable_or_empty' && (
+                <Alert variant="error">
+                    <p className="font-bold">This file could not be read. Please upload a readable replacement.</p>
+                    {!!verification.verification_reasons?.length && <ul className="mt-2 list-disc pl-5">{verification.verification_reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>}
+                    <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="mt-3"
+                        onClick={() => { setReplaceSubmissionId(Number(verification.submission_id)); setFile(null); fileInputRef.current?.click(); }}
+                    >
+                        Replace file
+                    </Button>
+                </Alert>
+            )}
+            {verification?.verification_verdict === 'partial_match' && (
+                <Alert variant="warning">
+                    <p className="font-semibold">This submission may not fully address the assignment.</p>
+                    {!!verification.verification_missing_requirements?.length && (
+                        <ul className="mt-2 list-disc pl-5">{verification.verification_missing_requirements.map((requirement, index) => <li key={index}>{requirement}</li>)}</ul>
+                    )}
+                </Alert>
+            )}
+            {verification?.verification_verdict === 'mismatch' && verification.status !== 'needs_attention' && (
+                <Alert variant="warning">
+                    <p className="font-semibold">This submission may not fully address the assignment, but it was sent for grading.</p>
+                    {!!verification.verification_reasons?.length && <ul className="mt-2 list-disc pl-5">{verification.verification_reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>}
+                </Alert>
+            )}
+            {(verification?.verification_verdict === 'unverified' || verification?.verification_verdict === 'unverifiable') && (
+                <Alert variant="warning">Automated assignment matching could not be confirmed. Your submission will be graded and reviewed manually if needed.</Alert>
+            )}
+            {verification?.verification_verdict === 'duplicate_submission' && (
+                <Alert variant="info">This appears to be the same file you already submitted for this assignment. It will still be graded.</Alert>
+            )}
+
             {success && (
                 <div className="p-3 bg-green-50 border border-green-200 rounded-md text-green-800 text-sm">
                     ✓ Assignment uploaded and evaluation started! Redirecting...
@@ -161,12 +241,21 @@ export default function UploadComponent({ assignments, onSuccess }: UploadCompon
                 className="w-full"
                 disabled={uploading || evaluating || !file || !assignmentId || assignments.length === 0}
             >
-                {uploading
-                    ? 'Uploading...'
-                    : evaluating
-                        ? 'Evaluating...'
-                        : 'Upload & Evaluate'}
+                {evaluating
+                    ? 'File uploaded — verifying and grading...'
+                    : uploading
+                        ? `Uploading file... ${uploadProgress}%`
+                        : replaceSubmissionId
+                            ? 'Replace & Verify'
+                            : 'Upload & Evaluate'}
             </Button>
+            {(uploading || evaluating) && (
+                <p className="text-center text-sm text-muted-foreground" role="status" aria-live="polite">
+                    {evaluating
+                        ? 'The file has been sent. Assignment verification and AI grading are still running.'
+                        : `Sending ${file?.name ?? 'file'} to secure storage: ${uploadProgress}%`}
+                </p>
+            )}
         </form>
     );
 }

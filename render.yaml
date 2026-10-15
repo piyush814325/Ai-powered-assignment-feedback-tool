@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: ai-assignment-feedback-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: assignment-submissions
+      - key: GROQ_MODEL_CLASSIFY
+        value: openai/gpt-oss-20b
+      - key: GROQ_MODEL_VERIFY
+        value: openai/gpt-oss-20b
+      - key: GROQ_MODEL_GRADE_FAST
+        value: openai/gpt-oss-20b
+      - key: GROQ_MODEL_GRADE_REASONING
+        value: openai/gpt-oss-120b
+      - key: GROQ_MODEL_VISION
+        value: ""
+      - key: MAX_UPLOAD_BYTES
+        value: "10485760"

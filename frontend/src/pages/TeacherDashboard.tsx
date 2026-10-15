@@ -9,15 +9,26 @@ import { ClassificationBadges } from '../components/dashboard/ClassificationBadg
 import { IssuesPanel } from '../components/dashboard/IssuesPanel';
 import { VisualContentWarning } from '../components/dashboard/VisualContentWarning';
 import ThemeToggle from '../components/ThemeToggle';
-import { formatDate, formatDateTime, fileName, getSubmissionDisplayTitle } from '../lib/grading';
+import { formatDate, formatDateTime, submissionFileName, getSubmissionDisplayTitle } from '../lib/grading';
 import type { Submission } from '../types/submission';
 import type { Assignment, RubricCriterion } from '../types/assignment';
 
-type FilterTab = 'pending' | 'reviewed' | 'all';
+type FilterTab = 'pending' | 'reviewed' | 'attention' | 'all';
 
 interface ApiError {
     response?: { data?: { detail?: string } };
 }
+
+const verificationFailureLabels: Record<string, string> = {
+    no_api_key: 'Groq API key is not configured.',
+    model_not_found: 'The configured verification model was not found.',
+    auth_failed: 'Groq rejected the configured API credentials.',
+    rate_limited: 'Groq rate-limited the verification request.',
+    timeout: 'The verification request timed out.',
+    invalid_json: 'The verifier returned invalid JSON.',
+    schema_validation_failed: 'The verifier response did not match the required schema.',
+    unknown: 'An unexpected verification error occurred.',
+};
 
 const emptyRubric = (): RubricCriterion[] => [
     { key: '', label: '', description: '', max_points: 25 },
@@ -42,8 +53,13 @@ export default function TeacherDashboard() {
     const [showSourceCode, setShowSourceCode] = useState(false);
     const [showAssignmentModal, setShowAssignmentModal] = useState(false);
     const [showManageAssignmentsModal, setShowManageAssignmentsModal] = useState(false);
+    const [showOverrideModal, setShowOverrideModal] = useState(false);
+    const [overrideReason, setOverrideReason] = useState('');
+    const [overrideError, setOverrideError] = useState('');
+    const [verificationError, setVerificationError] = useState('');
     const [editingAssignment, setEditingAssignment] = useState<Assignment | null>(null);
     const [assignmentError, setAssignmentError] = useState('');
+    const [assignmentManageError, setAssignmentManageError] = useState('');
     const [assignmentForm, setAssignmentForm] = useState({
         subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code', 'image'], rubric: emptyRubric(), is_active: true,
     });
@@ -131,8 +147,16 @@ export default function TeacherDashboard() {
     };
 
     const deactivateAssignment = async (assignment: Assignment) => {
-        await assignmentsAPI.remove(assignment.id);
-        await loadAssignments();
+        setAssignmentManageError('');
+        try {
+            await assignmentsAPI.remove(assignment.id);
+            await loadAssignments();
+        } catch (err) {
+            const apiError = err as ApiError;
+            setAssignmentManageError(
+                apiError.response?.data?.detail || 'Could not delete assignment',
+            );
+        }
     };
 
     const handleScoreChange = (criterion: string, value: number) => {
@@ -169,7 +193,7 @@ export default function TeacherDashboard() {
         if (!selectedSubmission) return;
         try {
             setIsSaving(true);
-            await submissionsAPI.evaluate(selectedSubmission.id, undefined, true);
+            await submissionsAPI.evaluate(selectedSubmission.id, undefined, false);
             await loadSubmissions();
         } catch (err) {
             console.error('Failed to re-evaluate', err);
@@ -180,6 +204,42 @@ export default function TeacherDashboard() {
 
     const pendingReview = useMemo(() => submissions.filter((s) => s.evaluation && !s.evaluation.is_reviewed), [submissions]);
     const reviewed = useMemo(() => submissions.filter((s) => s.evaluation && s.evaluation.is_reviewed), [submissions]);
+    const needsAttention = useMemo(() => submissions.filter((s) => s.status === 'needs_attention'), [submissions]);
+
+    const handleVerificationOverride = async () => {
+        if (!selectedSubmission || !overrideReason.trim()) {
+            setOverrideError('Enter a reason before grading this submission.');
+            return;
+        }
+        try {
+            setIsSaving(true);
+            setOverrideError('');
+            await submissionsAPI.overrideVerification(selectedSubmission.id, overrideReason.trim());
+            setShowOverrideModal(false);
+            setOverrideReason('');
+            await loadSubmissions();
+        } catch (err) {
+            const apiError = err as ApiError;
+            setOverrideError(apiError.response?.data?.detail || 'Could not override verification');
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    const handleRerunVerification = async () => {
+        if (!selectedSubmission) return;
+        try {
+            setIsSaving(true);
+            setVerificationError('');
+            await submissionsAPI.rerunVerification(selectedSubmission.id);
+            await loadSubmissions();
+        } catch (err) {
+            const apiError = err as ApiError;
+            setVerificationError(apiError.response?.data?.detail || 'Could not re-run verification');
+        } finally {
+            setIsSaving(false);
+        }
+    };
 
     const filteredSubmissions = useMemo(
         () =>
@@ -189,7 +249,9 @@ export default function TeacherDashboard() {
                         ? s.evaluation && !s.evaluation.is_reviewed
                         : filterTab === 'reviewed'
                             ? s.evaluation && s.evaluation.is_reviewed
-                            : true;
+                            : filterTab === 'attention'
+                                ? s.status === 'needs_attention'
+                                : true;
                 const query = searchTerm.toLowerCase();
                 const displayTitle = getSubmissionDisplayTitle(s);
                 const matchesSearch =
@@ -269,6 +331,7 @@ export default function TeacherDashboard() {
                                     [
                                         ['pending', `Pending (${pendingReview.length})`],
                                         ['reviewed', `Approved (${reviewed.length})`],
+                                        ['attention', `Needs attention (${needsAttention.length})`],
                                         ['all', `All (${submissions.length})`],
                                     ] as const
                                 ).map(([tab, label]) => (
@@ -327,6 +390,7 @@ export default function TeacherDashboard() {
                                                         Student #{sub.student_id}
                                                     </p>
                                                     <p className="text-[11px] text-muted-foreground">{formatDate(sub.created_at)}</p>
+                                                    {sub.status === 'needs_attention' && <Badge variant="danger" className="mt-2">Needs attention</Badge>}
                                                 </div>
 
                                                 {sub.evaluation && (
@@ -368,7 +432,7 @@ export default function TeacherDashboard() {
                                             </Badge>
                                         </div>
                                         <p className="text-xs text-muted-foreground mt-1 truncate">
-                                            {fileName(selectedSubmission.file_path)} · Submitted {formatDateTime(selectedSubmission.created_at)}
+                                            {submissionFileName(selectedSubmission)} · Submitted {formatDateTime(selectedSubmission.created_at)}
                                         </p>
                                     </div>
 
@@ -401,6 +465,63 @@ export default function TeacherDashboard() {
                                         </span>
                                     </Alert>
                                 )}
+
+                                <div className="space-y-3 rounded-lg border border-border p-4">
+                                    <div className="flex items-center gap-2">
+                                        <h3 className="text-sm font-bold text-foreground">Verification</h3>
+                                        {selectedSubmission.verification_verdict && (
+                                            <Badge variant={
+                                                selectedSubmission.verification_verdict === 'mismatch' || selectedSubmission.verification_verdict === 'unreadable_or_empty'
+                                                    ? 'danger'
+                                                    : selectedSubmission.verification_verdict === 'partial_match' || selectedSubmission.verification_verdict === 'unverified' || selectedSubmission.verification_verdict === 'unverifiable'
+                                                        ? 'warning'
+                                                        : 'success'
+                                            }>
+                                                {selectedSubmission.verification_verdict.replaceAll('_', ' ')}
+                                            </Badge>
+                                        )}
+                                    </div>
+                                    <div className="text-sm text-muted-foreground space-y-1">
+                                        {selectedSubmission.verification_detected_topic && <p><span className="font-semibold text-foreground">Detected topic:</span> {selectedSubmission.verification_detected_topic}</p>}
+                                        {selectedSubmission.verification_expected_topic && <p><span className="font-semibold text-foreground">Expected topic:</span> {selectedSubmission.verification_expected_topic}</p>}
+                                        {!!selectedSubmission.verification_reasons?.length && (
+                                            <ul className="list-disc pl-5">{selectedSubmission.verification_reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>
+                                        )}
+                                        {selectedSubmission.verification_error_code && (
+                                            <p>
+                                                <span className="font-semibold text-foreground">Failure reason:</span>{' '}
+                                                {verificationFailureLabels[selectedSubmission.verification_error_code] ??
+                                                    `Verification failed (${selectedSubmission.verification_error_code}).`}
+                                            </p>
+                                        )}
+                                    </div>
+                                    {verificationError && <Alert variant="error">{verificationError}</Alert>}
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={handleRerunVerification}
+                                        isLoading={isSaving}
+                                    >
+                                        Re-run verification
+                                    </Button>
+                                    {selectedSubmission.verification_verdict && ['mismatch', 'partial_match', 'unverifiable', 'unverified', 'unreadable_or_empty'].includes(selectedSubmission.verification_verdict) && (
+                                        <Alert variant={selectedSubmission.status === 'needs_attention' ? 'error' : 'warning'}>
+                                            <p className="font-semibold">
+                                                {selectedSubmission.status === 'needs_attention'
+                                                    ? 'This submission was held before grading because it could not be verified as matching the assignment.'
+                                                    : 'Review the assignment-match warning before approving this evaluation.'}
+                                            </p>
+                                            {!!selectedSubmission.verification_missing_requirements?.length && (
+                                                <ul className="mt-2 list-disc pl-5">{selectedSubmission.verification_missing_requirements.map((item, index) => <li key={index}>{item}</li>)}</ul>
+                                            )}
+                                        </Alert>
+                                    )}
+                                    {selectedSubmission.status === 'needs_attention' && (
+                                        <Button onClick={() => { setOverrideReason(''); setOverrideError(''); setShowOverrideModal(true); }}>
+                                            Grade anyway
+                                        </Button>
+                                    )}
+                                </div>
 
                                 {showSourceCode ? (
                                     <div className="space-y-3">
@@ -495,6 +616,35 @@ export default function TeacherDashboard() {
                 </div>
             </main>
 
+            <Modal
+                open={showOverrideModal}
+                onClose={() => setShowOverrideModal(false)}
+                title="Grade despite verification warning"
+                subtitle="Your reason will be recorded in the submission audit trail."
+                widthClassName="max-w-lg"
+                footer={
+                    <>
+                        <Button variant="outline" onClick={() => setShowOverrideModal(false)}>Cancel</Button>
+                        <Button onClick={handleVerificationOverride} isLoading={isSaving} disabled={!overrideReason.trim()}>
+                            Grade anyway
+                        </Button>
+                    </>
+                }
+            >
+                <form onSubmit={(event) => { event.preventDefault(); void handleVerificationOverride(); }} className="p-6 space-y-4">
+                    {overrideError && <Alert variant="error">{overrideError}</Alert>}
+                    <FormField label="Reason for override" htmlFor="verification-override-reason">
+                        <Textarea
+                            id="verification-override-reason"
+                            value={overrideReason}
+                            onChange={(event) => setOverrideReason(event.target.value)}
+                            placeholder="Explain why this submission should be graded despite the warning."
+                            required
+                        />
+                    </FormField>
+                </form>
+            </Modal>
+
             <Modal open={showAssignmentModal} onClose={() => setShowAssignmentModal(false)} title={editingAssignment ? 'Edit assignment' : 'Create assignment'} widthClassName="max-w-2xl">
                 <form onSubmit={saveAssignment} className="p-6 space-y-4">
                     {assignmentError && <Alert variant="error">{assignmentError}</Alert>}
@@ -537,6 +687,7 @@ export default function TeacherDashboard() {
                 widthClassName="max-w-3xl"
             >
                 <div className="p-6 space-y-4">
+                    {assignmentManageError && <Alert variant="error">{assignmentManageError}</Alert>}
                     {assignments.length === 0 ? (
                         <EmptyState
                             title="No assignments created yet"
@@ -593,7 +744,7 @@ export default function TeacherDashboard() {
                                             size="sm"
                                             variant="destructive"
                                             onClick={() => deactivateAssignment(assignment)}
-                                            title="Delete assignment"
+                                            title="Permanently delete assignment (only when it has no submissions)"
                                         >
                                             <Trash2 className="h-3.5 w-3.5" />
                                         </Button>

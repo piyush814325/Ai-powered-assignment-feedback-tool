@@ -40,14 +40,30 @@ export const assignmentsAPI = {
 
 // Submissions API
 export const submissionsAPI = {
-    upload: (file: File, assignmentId: number) => {
+    upload: (file: File, assignmentId: number, onUploadProgress?: (progress: { loaded: number; total?: number }) => void) => {
         const formData = new FormData();
         formData.append('file', file);
         formData.append('assignment_id', assignmentId.toString());
         return apiClient.post('/submissions/upload', formData, {
             headers: { 'Content-Type': 'multipart/form-data' },
+            onUploadProgress,
         });
     },
+
+    replace: (submissionId: number, file: File, onUploadProgress?: (progress: { loaded: number; total?: number }) => void) => {
+        const formData = new FormData();
+        formData.append('file', file);
+        return apiClient.post(`/submissions/${submissionId}/replace`, formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+            onUploadProgress,
+        });
+    },
+
+    overrideVerification: (submissionId: number, reason: string) =>
+        apiClient.post(`/submissions/${submissionId}/verification/override`, { reason }),
+
+    rerunVerification: (submissionId: number) =>
+        apiClient.post(`/submissions/${submissionId}/verification/rerun`),
 
     evaluate: (submissionId: number, rubricId?: number, useMockLLM: boolean = true) =>
         apiClient.post(`/submissions/evaluate/${submissionId}`, null, {

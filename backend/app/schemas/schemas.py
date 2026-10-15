@@ -15,6 +15,7 @@ class SubmissionStatus(str, Enum):
     PROCESSING = "processing"
     READY = "ready"
     FAILED = "failed"
+    NEEDS_ATTENTION = "needs_attention"
 
 
 # Auth Schemas
@@ -111,10 +112,24 @@ class SubmissionResponse(BaseModel):
     assignment_id: int
     assignment: Optional[AssignmentResponse] = None
     file_path: str
+    original_filename: Optional[str] = None
     file_type: str
     status: SubmissionStatus
     extracted_text: Optional[str] = None
     extracted_code: Optional[str] = None
+    content_hash: Optional[str] = None
+    verification_verdict: Optional[str] = None
+    verification_confidence: Optional[float] = None
+    verification_detected_topic: Optional[str] = None
+    verification_expected_topic: Optional[str] = None
+    verification_reasons: Optional[List[str]] = None
+    verification_missing_requirements: Optional[List[str]] = None
+    verification_model: Optional[str] = None
+    verification_error_code: Optional[str] = None
+    teacher_override: bool = False
+    teacher_override_by: Optional[int] = None
+    teacher_override_at: Optional[datetime] = None
+    teacher_override_reason: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -124,6 +139,24 @@ class SubmissionResponse(BaseModel):
 
 class SubmissionWithEvaluation(SubmissionResponse):
     evaluation: Optional["EvaluationResponse"] = None
+
+
+class SubmissionEvaluationResponse(BaseModel):
+    submission_id: int
+    status: SubmissionStatus
+    evaluation: Optional["EvaluationResponse"] = None
+    verification_verdict: Optional[str] = None
+    verification_confidence: Optional[float] = None
+    verification_detected_topic: Optional[str] = None
+    verification_expected_topic: Optional[str] = None
+    verification_reasons: Optional[List[str]] = None
+    verification_missing_requirements: Optional[List[str]] = None
+    verification_model: Optional[str] = None
+    verification_error_code: Optional[str] = None
+
+
+class VerificationOverrideRequest(BaseModel):
+    reason: str
 
 
 # Evaluation Schemas

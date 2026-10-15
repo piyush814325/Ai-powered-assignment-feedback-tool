@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { BarChart3, FileText, Plus, Printer, RefreshCw, Sparkles, X } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { assignmentsAPI, submissionsAPI } from '../services/api';
-import { Button, Card, Input, Select, Badge, Spinner, EmptyState, Modal } from '../ui/components';
+import { Button, Card, Input, Select, Badge, Spinner, EmptyState, Modal, Alert } from '../ui/components';
 import { StatCard } from '../components/dashboard/StatCard';
 import { EvaluationCriteria } from '../components/dashboard/EvaluationCriteria';
 import { ClassificationBadges } from '../components/dashboard/ClassificationBadges';
@@ -10,11 +10,11 @@ import { IssuesPanel } from '../components/dashboard/IssuesPanel';
 import { VisualContentWarning } from '../components/dashboard/VisualContentWarning';
 import UploadComponent from '../components/UploadComponent';
 import ThemeToggle from '../components/ThemeToggle';
-import { getGradeLetter, getGradeBadgeClasses, getStatusBadgeClasses, formatDateTime, fileName, getSubmissionDisplayTitle } from '../lib/grading';
+import { getGradeLetter, getGradeBadgeClasses, getStatusBadgeClasses, formatDateTime, submissionFileName, getSubmissionDisplayTitle } from '../lib/grading';
 import type { Submission } from '../types/submission';
 import type { Assignment } from '../types/assignment';
 
-type StatusFilter = 'all' | 'ready' | 'processing' | 'uploaded' | 'failed';
+type StatusFilter = 'all' | 'ready' | 'processing' | 'uploaded' | 'failed' | 'needs_attention';
 type ModalTab = 'feedback' | 'extracted';
 
 export default function StudentDashboard() {
@@ -27,6 +27,7 @@ export default function StudentDashboard() {
     const [activeTab, setActiveTab] = useState<ModalTab>('feedback');
     const [searchTerm, setSearchTerm] = useState('');
     const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+    const [submissionToReplace, setSubmissionToReplace] = useState<Submission | undefined>();
 
     const loadAssignments = async () => {
         try {
@@ -54,8 +55,11 @@ export default function StudentDashboard() {
         loadAssignments();
     }, []);
 
-    const handleUploadSuccess = () => {
-        setShowUpload(false);
+    const handleUploadSuccess = (closeUpload = true) => {
+        if (closeUpload) {
+            setShowUpload(false);
+            setSubmissionToReplace(undefined);
+        }
         loadSubmissions();
     };
 
@@ -65,7 +69,8 @@ export default function StudentDashboard() {
                 const query = searchTerm.toLowerCase();
                 const displayTitle = getSubmissionDisplayTitle(sub);
                 const matchesSearch =
-                    displayTitle.toLowerCase().includes(query) || sub.file_path.toLowerCase().includes(query);
+                    displayTitle.toLowerCase().includes(query) ||
+                    submissionFileName(sub).toLowerCase().includes(query);
                 const displayStatus = (sub.evaluation && sub.status === 'failed') ? 'ready' : sub.status;
                 const matchesStatus = statusFilter === 'all' || displayStatus === statusFilter;
                 return matchesSearch && matchesStatus;
@@ -127,7 +132,7 @@ export default function StudentDashboard() {
                                     Upload a PDF, Word doc, code file, or image to get instant AI feedback.
                                 </p>
                             </div>
-                            <Button onClick={() => setShowUpload(true)} size="lg" className="shrink-0">
+                            <Button onClick={() => { setSubmissionToReplace(undefined); setShowUpload(true); }} size="lg" className="shrink-0">
                                 <Plus className="h-4 w-4" />
                                 New submission
                             </Button>
@@ -135,14 +140,14 @@ export default function StudentDashboard() {
                     ) : (
                         <Card className="p-6 relative">
                             <button
-                                onClick={() => setShowUpload(false)}
+                                onClick={() => { setShowUpload(false); setSubmissionToReplace(undefined); }}
                                 aria-label="Close upload form"
                                 className="absolute top-4 right-4 text-muted-foreground hover:text-foreground"
                             >
                                 <X className="h-4 w-4" />
                             </button>
                             <h2 className="text-lg font-bold mb-4 text-foreground">Submit assignment</h2>
-                            <UploadComponent assignments={assignments} onSuccess={handleUploadSuccess} />
+                            <UploadComponent assignments={assignments} onSuccess={handleUploadSuccess} submissionToReplace={submissionToReplace} />
                         </Card>
                     )}
                 </div>
@@ -171,6 +176,7 @@ export default function StudentDashboard() {
                                 <option value="processing">Processing</option>
                                 <option value="uploaded">Uploaded</option>
                                 <option value="failed">Failed</option>
+                                <option value="needs_attention">Needs attention</option>
                             </Select>
                             <Button variant="outline" size="sm" onClick={loadSubmissions} title="Refresh">
                                 <RefreshCw className="h-4 w-4" />
@@ -208,7 +214,9 @@ export default function StudentDashboard() {
                                                 {(() => {
                                                     const displayStatus = (submission.evaluation && submission.status === 'failed') ? 'ready' : submission.status;
                                                     return (
-                                                        <Badge className={getStatusBadgeClasses(displayStatus)}>{displayStatus}</Badge>
+                                                        <Badge className={getStatusBadgeClasses(displayStatus)}>
+                                                            {displayStatus === 'needs_attention' ? 'Needs attention' : displayStatus}
+                                                        </Badge>
                                                     );
                                                 })()}
                                                 {submission.evaluation?.is_reviewed && (
@@ -216,7 +224,7 @@ export default function StudentDashboard() {
                                                 )}
                                             </div>
                                             <p className="text-xs text-muted-foreground truncate">
-                                                {fileName(submission.file_path)} · {submission.file_type.toUpperCase()}
+                                                {submissionFileName(submission)} · {submission.file_type.toUpperCase()}
                                             </p>
                                             <p className="text-xs text-muted-foreground">
                                                 Submitted {formatDateTime(submission.created_at)}
@@ -254,6 +262,19 @@ export default function StudentDashboard() {
                                             >
                                                 View evaluation
                                             </Button>
+                                            {submission.status === 'needs_attention' && (
+                                                <Button
+                                                    variant="outline"
+                                                    size="sm"
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        setSubmissionToReplace(submission);
+                                                        setShowUpload(true);
+                                                    }}
+                                                >
+                                                    Replace file
+                                                </Button>
+                                            )}
                                         </div>
                                     </div>
                                 </Card>
@@ -269,7 +290,7 @@ export default function StudentDashboard() {
                 title={selectedSubmission ? getSubmissionDisplayTitle(selectedSubmission) : ''}
                 subtitle={
                     selectedSubmission &&
-                    `Submitted ${formatDateTime(selectedSubmission.created_at)} · ${fileName(selectedSubmission.file_path)}`
+                    `Submitted ${formatDateTime(selectedSubmission.created_at)} · ${submissionFileName(selectedSubmission)}`
                 }
                 footer={
                     <>
@@ -307,6 +328,39 @@ export default function StudentDashboard() {
                         </div>
 
                         <div className="p-6 space-y-6">
+                            {selectedSubmission.verification_verdict && (
+                                <Alert variant={
+                                    selectedSubmission.verification_verdict === 'mismatch' || selectedSubmission.verification_verdict === 'unreadable_or_empty'
+                                        ? 'error'
+                                        : selectedSubmission.verification_verdict === 'partial_match' || selectedSubmission.verification_verdict === 'unverified' || selectedSubmission.verification_verdict === 'unverifiable'
+                                            ? 'warning'
+                                            : 'info'
+                                }>
+                                    <p className="font-semibold">
+                                        {selectedSubmission.verification_verdict === 'mismatch'
+                                            ? `This file doesn't appear to match ${selectedSubmission.assignment?.title ?? 'the assignment'}.`
+                                            : selectedSubmission.verification_verdict === 'partial_match'
+                                                ? 'This submission may not fully address the assignment.'
+                                                : selectedSubmission.verification_verdict === 'unreadable_or_empty'
+                                                    ? 'This file could not be read. Please replace it with a readable file.'
+                                                    : selectedSubmission.verification_verdict === 'unverifiable'
+                                                        ? 'The image content could not be verified automatically and will be reviewed manually.'
+                                                        : selectedSubmission.verification_verdict === 'unverified'
+                                                            ? 'Automated assignment matching could not be confirmed; the submission was graded.'
+                                                            : selectedSubmission.verification_verdict === 'duplicate_submission'
+                                                                ? 'This appears to be the same file you already submitted for this assignment.'
+                                                                : 'Assignment match verified.'}
+                                    </p>
+                                    {selectedSubmission.verification_detected_topic && <p className="mt-1">Detected topic: {selectedSubmission.verification_detected_topic}</p>}
+                                    {selectedSubmission.verification_expected_topic && <p>Expected topic: {selectedSubmission.verification_expected_topic}</p>}
+                                    {!!selectedSubmission.verification_reasons?.length && (
+                                        <ul className="mt-2 list-disc pl-5">{selectedSubmission.verification_reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>
+                                    )}
+                                    {!!selectedSubmission.verification_missing_requirements?.length && (
+                                        <ul className="mt-2 list-disc pl-5">{selectedSubmission.verification_missing_requirements.map((requirement, index) => <li key={index}>{requirement}</li>)}</ul>
+                                    )}
+                                </Alert>
+                            )}
                             {activeTab === 'feedback' ? (
                                 selectedSubmission.evaluation ? (
                                     <div className="space-y-6">

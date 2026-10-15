@@ -16,6 +16,7 @@ class ModelCategory(str, Enum):
     GRADE_FAST = "grade_fast"
     GRADE_REASONING = "grade_reasoning"
     VISION = "vision"
+    VERIFY = "verify"
 
 
 # Active Groq models (verified 2026-08-31)
@@ -24,6 +25,7 @@ DEFAULT_MODELS = {
     "GROQ_MODEL_GRADE_FAST": "openai/gpt-oss-20b",  # Fast text grading
     "GROQ_MODEL_GRADE_REASONING": "openai/gpt-oss-120b",  # Powerful reasoning for complex submissions
     "GROQ_MODEL_VISION": "",  # Empty = disabled (no vision models currently available on this account)
+    "GROQ_MODEL_VERIFY": "openai/gpt-oss-20b",  # Fast/cheap assignment relevance verification
 }
 
 
@@ -45,6 +47,7 @@ def get_model(category: ModelCategory) -> str:
         ModelCategory.GRADE_FAST: "GROQ_MODEL_GRADE_FAST",
         ModelCategory.GRADE_REASONING: "GROQ_MODEL_GRADE_REASONING",
         ModelCategory.VISION: "GROQ_MODEL_VISION",
+        ModelCategory.VERIFY: "GROQ_MODEL_VERIFY",
     }
     
     env_key = env_key_map[category]

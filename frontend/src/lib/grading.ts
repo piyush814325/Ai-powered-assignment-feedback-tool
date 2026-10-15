@@ -33,6 +33,7 @@ const STATUS_STYLES: Record<string, string> = {
     processing: 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 animate-pulse',
     uploaded: 'bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300',
     failed: 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300',
+    needs_attention: 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300',
 };
 
 export function getStatusBadgeClasses(status: SubmissionStatus): string {
@@ -58,8 +59,12 @@ export function fileName(path: string): string {
     return rawName.replace(/^\d+(\.\d+)?_/, '');
 }
 
-export function getSubmissionDisplayTitle(submission: { assignment_id?: number; assignment?: { title: string }; file_path: string }): string {
+export function submissionFileName(submission: { file_path: string; original_filename?: string | null }): string {
+    return submission.original_filename || fileName(submission.file_path);
+}
+
+export function getSubmissionDisplayTitle(submission: { assignment_id?: number; assignment?: { title: string }; file_path: string; original_filename?: string | null }): string {
     if (submission.assignment?.title) return submission.assignment.title;
-    const cleanName = fileName(submission.file_path);
+    const cleanName = submissionFileName(submission);
     return cleanName || 'Assignment Submission';
 }
