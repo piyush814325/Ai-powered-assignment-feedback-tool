@@ -414,9 +414,22 @@ def test_pdf_parser_merges_ocr_text_for_scanned_pages(monkeypatch):
             return None
 
     monkeypatch.setattr(document_parser.fitz, "open", lambda **_kwargs: Document())
+    monkeypatch.setattr(DocumentParser, "tesseract_available", staticmethod(lambda: True))
     monkeypatch.setattr(document_parser.pytesseract, "image_to_string", lambda _image: "OCR extracted assignment text")
     text_content, _, _, _ = DocumentParser._parse_pdf(b"scanned.pdf")
     assert "OCR extracted assignment text" in text_content
+
+
+def test_image_parser_skips_ocr_when_tesseract_is_unavailable(monkeypatch):
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (4, 4), color="white").save(image_bytes, format="PNG")
+    monkeypatch.setattr(DocumentParser, "tesseract_available", staticmethod(lambda: False))
+
+    text_content, _, images, file_type = DocumentParser._parse_image(image_bytes.getvalue())
+
+    assert text_content == ""
+    assert images
+    assert file_type == "image"
 
 
 def test_teacher_override_records_audit_and_grades(db, monkeypatch):

@@ -1,16 +1,26 @@
 import logging
 import os
+import time
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from app.routers import assignments, auth, submissions
-from app.database import Base, engine, SessionLocal
+from app.database import (
+    Base,
+    DATABASE_URL,
+    classify_database_error,
+    database_connection_target,
+    engine,
+    sanitize_database_error,
+    SessionLocal,
+)
 from app.models import Rubric
 from app.services.groq_models import ModelCategory, get_model
 from app.migration import run_migrations
+from app.services.document_parser import DocumentParser
 import app.models  # Import models so they register with Base.metadata
 
 logger = logging.getLogger(__name__)
@@ -67,20 +77,69 @@ def initialize_database() -> None:
             "Supabase Storage settings are required: "
             + ", ".join(missing_storage_settings)
         )
-    try:
-        with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
-        Base.metadata.create_all(bind=engine)
-        run_migrations(engine)
-        seed_default_rubric()
-    except SQLAlchemyError as error:
-        logger.error(
-            "Database startup failed: exception_type=%s; check DATABASE_URL and Supabase availability",
-            type(error).__name__,
+    target = database_connection_target(DATABASE_URL)
+    logger.info("Database connection target: %s", target)
+    if target["host_kind"] == "supabase direct (db.<ref>.supabase.co)":
+        logger.warning(
+            "DATABASE_URL uses a Supabase direct database host. Direct connections are IPv6-only "
+            "and will not work on Render; use the Supabase Session Pooler connection string."
         )
-        raise RuntimeError(
-            "Unable to connect to or initialize the Supabase PostgreSQL database"
-        ) from None
+
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            Base.metadata.create_all(bind=engine)
+            run_migrations(engine)
+            seed_default_rubric()
+            if not DocumentParser.tesseract_available():
+                logger.warning(
+                    "Tesseract OCR binary is unavailable; scanned/image-only submissions "
+                    "will be marked unverifiable or not evaluated."
+                )
+            return
+        except OperationalError as error:
+            safe_message = sanitize_database_error(error)
+            hint = classify_database_error(error)
+            if attempt < max_attempts:
+                delay = min(0.25 * (2 ** (attempt - 1)), 2.0)
+                logger.warning(
+                    "Database startup attempt failed: attempt=%s/%s exception_type=%s "
+                    "message=%s hint=%s retry_in_seconds=%.2f",
+                    attempt,
+                    max_attempts,
+                    type(error).__name__,
+                    safe_message,
+                    hint,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            logger.error(
+                "Database startup failed: attempt=%s/%s exception_type=%s message=%s "
+                "hint=%s target=%s",
+                attempt,
+                max_attempts,
+                type(error).__name__,
+                safe_message,
+                hint,
+                target,
+            )
+            raise RuntimeError(
+                f"Unable to initialize Supabase PostgreSQL: {hint} Details: {safe_message}"
+            ) from error
+        except SQLAlchemyError as error:
+            safe_message = sanitize_database_error(error)
+            logger.error(
+                "Database initialization failed: exception_type=%s message=%s target=%s",
+                type(error).__name__,
+                safe_message,
+                target,
+            )
+            raise RuntimeError(
+                f"Unable to initialize Supabase PostgreSQL: {safe_message}"
+            ) from error
 
 
 @app.on_event("startup")

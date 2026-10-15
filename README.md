@@ -32,6 +32,9 @@ environment-configurable; see [.env.example](./.env.example).
 2. In **Connect**, choose the **Session pooler** and port **5432**. Copy its
    connection URL into `DATABASE_URL`. The backend normalizes `postgres://`,
    uses the psycopg2 driver, and enforces `sslmode=require`.
+   If you manually insert a database password into the URL, percent-encode
+   reserved characters such as `@`, `:`, `/`, and `#` first. Prefer the URL
+   copied from Supabase and replace only its password with an encoded value.
 3. In **Storage**, create a private bucket named `assignment-submissions` (or
    set `SUPABASE_BUCKET` to another private bucket name). Do not add public read
    policies or expose the service-role key to the frontend.
@@ -77,6 +80,7 @@ database access.
 Deploy from the repository root using [render.yaml](./render.yaml). Set:
 
 - `DATABASE_URL`: Supabase Session Pooler URL (port 5432)
+- `PYTHON_VERSION`: `3.12.10` (the Docker image is pinned to the same Python version)
 - `JWT_SECRET`: long random signing secret
 - `GROQ_API_KEY`: optional Groq key (leave unset for mock operation)
 - `CORS_ORIGINS`: exact deployed frontend origin(s), comma-separated
@@ -86,6 +90,19 @@ The Docker image installs Tesseract and the English language pack, runs as a
 non-root user, and binds Uvicorn to Render's `$PORT`. Uploaded files are stored
 in the private Supabase Storage bucket, not on Render's ephemeral filesystem.
 `/health` checks PostgreSQL and returns 503 when the database is unavailable.
+The Render service must use the repository's **Docker** runtime so the image
+installs Tesseract and uses the pinned Python version. If an existing Render
+service was created with the native Python runtime, update it to the Blueprint's
+Docker service (or recreate it from `render.yaml`); setting `PYTHON_VERSION`
+alone does not install Tesseract. A `.env` file is only for local development;
+Render settings are read from the service's environment variables.
+
+To test a configured database connection locally without printing credentials,
+run this from `backend` (where the local `.env` file is normally loaded):
+
+```powershell
+python ..\scripts\check_db.py
+```
 
 ## MySQL data transfer
 

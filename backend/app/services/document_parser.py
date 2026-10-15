@@ -1,14 +1,19 @@
 import base64
 import io
+import logging
+import os
 from pathlib import Path
+import shutil
 from typing import List, Optional, Tuple
 
-import fitz
+import pymupdf as fitz
 import pytesseract
 from docx import Document
 from PIL import Image
 
 from app.config import VERIFICATION_MIN_CONTENT_CHARS
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentParser:
@@ -18,6 +23,23 @@ class DocumentParser:
         ".pdf", ".docx", ".txt", ".py", ".java", ".cpp", ".js", ".ts",
         ".png", ".jpg", ".jpeg",
     }
+
+    @staticmethod
+    def tesseract_available() -> bool:
+        command = pytesseract.pytesseract.tesseract_cmd
+        if os.path.dirname(command):
+            return os.path.isfile(command)
+        return shutil.which(command) is not None
+
+    @staticmethod
+    def _extract_ocr_text(image: Image.Image) -> str:
+        if not DocumentParser.tesseract_available():
+            return ""
+        try:
+            return pytesseract.image_to_string(image)
+        except Exception as error:
+            logger.warning("OCR failed; exception_type=%s", type(error).__name__)
+            return ""
 
     @staticmethod
     def parse_document(
@@ -44,15 +66,15 @@ class DocumentParser:
             for page_num in range(doc.page_count):
                 page = doc.load_page(page_num)
                 page_text = page.get_text("text")
-                if len(" ".join(str(page_text).split())) < VERIFICATION_MIN_CONTENT_CHARS:
-                    try:
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                        page_image = Image.open(io.BytesIO(pix.tobytes("png")))
-                        ocr_text = pytesseract.image_to_string(page_image)
-                        if ocr_text.strip():
-                            page_text = f"{page_text}\n{ocr_text}"
-                    except Exception:
-                        pass
+                if (
+                    len(" ".join(str(page_text).split())) < VERIFICATION_MIN_CONTENT_CHARS
+                    and DocumentParser.tesseract_available()
+                ):
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                    page_image = Image.open(io.BytesIO(pix.tobytes("png")))
+                    ocr_text = DocumentParser._extract_ocr_text(page_image)
+                    if ocr_text.strip():
+                        page_text = f"{page_text}\n{ocr_text}"
                 text += f"--- Page {page_num + 1} ---\n{page_text}\n"
 
                 for image_info in page.get_images():
@@ -98,10 +120,7 @@ class DocumentParser:
     def _parse_image(content: bytes) -> Tuple[str, None, Optional[List[str]], str]:
         try:
             image = Image.open(io.BytesIO(content))
-            try:
-                text = pytesseract.image_to_string(image)
-            except Exception:
-                text = "[OCR text extraction unavailable: Tesseract engine not found on server]"
+            text = DocumentParser._extract_ocr_text(image)
             encoded = base64.b64encode(content).decode("utf-8")
             return text, None, [f"data:image/png;base64,{encoded}"], "image"
         except Exception as error:

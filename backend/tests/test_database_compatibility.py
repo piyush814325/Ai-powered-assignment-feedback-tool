@@ -6,11 +6,18 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, func, inspect, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app.database import Base, engine, normalize_database_url
+from app.database import (
+    Base,
+    classify_database_error,
+    database_connection_target,
+    engine,
+    normalize_database_url,
+    sanitize_database_error,
+)
 from app.migration import run_migrations
 from app.models import Assignment, Evaluation, Submission, SubmissionStatus, User, UserRole
 from app.routers.assignments import delete_assignment
@@ -106,6 +113,15 @@ def test_postgres_url_normalization():
         normalize_database_url("postgresql://user:password@host:6543/db")
 
 
+def test_postgres_url_normalization_strips_quotes_and_requires_ssl():
+    normalized = normalize_database_url(
+        '  "postgres://postgres.project-ref:pass%40word@aws-0-region.pooler.supabase.com:5432/postgres"\r\n'
+    )
+    parsed = make_url(normalized)
+    assert parsed.drivername == "postgresql+psycopg2"
+    assert parsed.password == "pass@word"
+
+
 def test_engine_uses_postgres_pool_and_ssl_settings():
     assert engine.url.drivername == "postgresql+psycopg2"
     assert engine.url.query["sslmode"] == "require"
@@ -113,6 +129,52 @@ def test_engine_uses_postgres_pool_and_ssl_settings():
     assert engine.pool._recycle == 1800
     assert engine.pool.size() == 5
     assert engine.pool._max_overflow == 5
+
+
+def test_connection_target_classifies_supabase_hosts_without_password():
+    target = database_connection_target(
+        "postgresql+psycopg2://postgres.project-ref:secret@"
+        "aws-0-region.pooler.supabase.com:5432/postgres?sslmode=require"
+    )
+    assert target == {
+        "host": "aws-0-region.pooler.supabase.com",
+        "port": 5432,
+        "database": "postgres",
+        "username_prefix": "postgres.project...",
+        "sslmode_set": True,
+        "host_kind": "supabase pooler",
+    }
+    assert "secret" not in str(target)
+
+    direct_target = database_connection_target(
+        "postgresql://postgres:secret@db.project-ref.supabase.co:5432/postgres"
+    )
+    assert direct_target["host_kind"] == "supabase direct (db.<ref>.supabase.co)"
+
+
+@pytest.mark.parametrize(
+    ("message", "hint"),
+    [
+        ("could not translate host name", "DNS or network failure"),
+        ("password authentication failed", "rejected authentication"),
+        ("Tenant or user not found", "pooler tenant/user"),
+        ("connection timed out", "timed out"),
+        ("SSL SYSCALL error", "SSL connection failed"),
+    ],
+)
+def test_database_error_classification(message, hint):
+    assert hint in classify_database_error(RuntimeError(message))
+
+
+def test_database_error_sanitization_removes_connection_credentials():
+    error = RuntimeError(
+        "failed postgres://postgres.project:top-secret@pooler.example/db "
+        "password=top-secret for user 'postgres.project'"
+    )
+    safe_message = sanitize_database_error(error)
+    assert "top-secret" not in safe_message
+    assert "postgres.project" not in safe_message
+    assert "[REDACTED_CONNECTION_URI]" in safe_message
 
 
 def test_case_insensitive_email_and_name_lookup(compatibility_db):
@@ -288,6 +350,46 @@ def test_health_check_reports_database_success_and_failure(monkeypatch):
     with pytest.raises(HTTPException) as error:
         health_check()
     assert error.value.status_code == 503
+
+
+def test_database_startup_retries_and_logs_sanitized_failure(monkeypatch, caplog):
+    import main
+
+    failure = OperationalError(
+        "connect",
+        {},
+        RuntimeError("Tenant or user not found"),
+    )
+
+    class FailingEngine:
+        attempts = 0
+
+        def connect(self):
+            self.attempts += 1
+            raise failure
+
+    fake_engine = FailingEngine()
+    monkeypatch.setattr(main, "engine", fake_engine)
+    monkeypatch.setattr(main.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        main,
+        "DATABASE_URL",
+        "postgresql://postgres.project-ref:test-password@"
+        "aws-0-region.pooler.supabase.com:5432/postgres",
+    )
+    monkeypatch.setenv("JWT_SECRET", "test-jwt-secret")
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key")
+    monkeypatch.setenv("SUPABASE_BUCKET", "private-uploads")
+
+    with pytest.raises(RuntimeError, match="pooler tenant/user") as error:
+        main.initialize_database()
+
+    assert fake_engine.attempts == 5
+    assert error.value.__cause__ is failure
+    assert "test-password" not in caplog.text
+    assert "test-service-role-key" not in caplog.text
+    assert "Tenant or user not found" in caplog.text
 
 
 @pytest.mark.skipif(not os.getenv("TEST_POSTGRES_URL"), reason="requires a disposable PostgreSQL test database")
