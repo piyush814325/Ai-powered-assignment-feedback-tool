@@ -1,3 +1,5 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import logging
 import os
 import time
@@ -5,9 +7,10 @@ import time
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
-from app.routers import assignments, auth, submissions
+from app.routers import assignments, auth, roster_import, submissions, teacher_uploads
 from app.database import (
     Base,
     DATABASE_URL,
@@ -21,6 +24,7 @@ from app.models import Rubric
 from app.services.groq_models import ModelCategory, get_model
 from app.migration import run_migrations
 from app.services.document_parser import DocumentParser
+from app.routers.teacher_uploads import schedule_stale_upload_sweep
 import app.models  # Import models so they register with Base.metadata
 
 logger = logging.getLogger(__name__)
@@ -55,11 +59,9 @@ def seed_default_rubric():
     finally:
         db.close()
 
-app = FastAPI(title="AI Assignment Feedback Tool", version="0.1.0")
 _groq_models_checked = False
 
 
-@app.on_event("startup")
 def initialize_database() -> None:
     if not os.getenv("JWT_SECRET", "").strip():
         raise RuntimeError("JWT_SECRET must be configured in the environment")
@@ -92,6 +94,7 @@ def initialize_database() -> None:
                 connection.execute(text("SELECT 1"))
             Base.metadata.create_all(bind=engine)
             run_migrations(engine)
+            schedule_stale_upload_sweep()
             seed_default_rubric()
             if not DocumentParser.tesseract_available():
                 logger.warning(
@@ -142,7 +145,6 @@ def initialize_database() -> None:
             ) from error
 
 
-@app.on_event("startup")
 async def log_groq_configuration() -> None:
     global _groq_models_checked
     api_key = os.getenv("GROQ_API_KEY", "")
@@ -198,6 +200,20 @@ async def log_groq_configuration() -> None:
             status_code,
         )
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    await run_in_threadpool(initialize_database)
+    await log_groq_configuration()
+    yield
+
+
+app = FastAPI(
+    title="AI Assignment Feedback Tool",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -215,7 +231,10 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(assignments.router)
+app.include_router(roster_import.router)
 app.include_router(submissions.router)
+app.include_router(submissions.student_router)
+app.include_router(teacher_uploads.router)
 
 @app.get("/health")
 def health_check():

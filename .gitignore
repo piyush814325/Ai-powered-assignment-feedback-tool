@@ -15,6 +15,12 @@ backend/__pycache__/
 # Uploaded/generated project files
 backend/uploads/
 uploads/
+**/sample/*.xlsx
+**/samples/*.xlsx
+**/fixtures/*.xlsx
+**/sample/**/*.xlsx
+**/samples/**/*.xlsx
+**/fixtures/**/*.xlsx
 
 # Node / frontend
 frontend/node_modules/

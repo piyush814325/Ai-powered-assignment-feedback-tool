@@ -17,6 +17,7 @@ export interface Assignment {
     allowed_file_types: string[];
     rubric: RubricCriterion[];
     is_active: boolean;
+    student_topic?: string | null;
     submission_count: number;
     created_at: string;
     updated_at: string;

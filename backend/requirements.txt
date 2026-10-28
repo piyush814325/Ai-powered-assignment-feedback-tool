@@ -14,3 +14,5 @@ pytesseract==0.3.13
 pydantic[email]==2.13.4
 psycopg2-binary==2.9.12
 supabase==2.32.0
+openpyxl==3.1.5
+rapidfuzz==3.14.3

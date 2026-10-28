@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
-import { BarChart3, FileText, Plus, Printer, RefreshCw, Sparkles, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { BarChart3, FileText, Plus, Printer, RefreshCw, Sparkles, Trash2, X } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
-import { assignmentsAPI, submissionsAPI } from '../services/api';
+import { assignmentsAPI, getApiErrorMessage, submissionsAPI } from '../services/api';
 import { Button, Card, Input, Select, Badge, Spinner, EmptyState, Modal, Alert } from '../ui/components';
+import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal';
 import { StatCard } from '../components/dashboard/StatCard';
 import { EvaluationCriteria } from '../components/dashboard/EvaluationCriteria';
 import { ClassificationBadges } from '../components/dashboard/ClassificationBadges';
@@ -10,12 +11,13 @@ import { IssuesPanel } from '../components/dashboard/IssuesPanel';
 import { VisualContentWarning } from '../components/dashboard/VisualContentWarning';
 import UploadComponent from '../components/UploadComponent';
 import ThemeToggle from '../components/ThemeToggle';
-import { getGradeLetter, getGradeBadgeClasses, getStatusBadgeClasses, formatDateTime, submissionFileName, getSubmissionDisplayTitle } from '../lib/grading';
+import { getGradeLetter, getGradeBadgeClasses, getStatusBadgeClasses, getSubmissionStatusLabel, formatDateTime, submissionFileName, getSubmissionDisplayTitle } from '../lib/grading';
 import type { Submission } from '../types/submission';
 import type { Assignment } from '../types/assignment';
 
-type StatusFilter = 'all' | 'ready' | 'processing' | 'uploaded' | 'failed' | 'needs_attention';
+type StatusFilter = 'all' | 'ready' | 'processing' | 'uploaded' | 'failed' | 'needs_attention' | 'pending_teacher_review';
 type ModalTab = 'feedback' | 'extracted';
+const statusFilters: StatusFilter[] = ['all', 'ready', 'processing', 'uploaded', 'failed', 'needs_attention', 'pending_teacher_review'];
 
 export default function StudentDashboard() {
     const { user, logout } = useAuthStore();
@@ -28,32 +30,39 @@ export default function StudentDashboard() {
     const [searchTerm, setSearchTerm] = useState('');
     const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
     const [submissionToReplace, setSubmissionToReplace] = useState<Submission | undefined>();
+    const [submissionToDelete, setSubmissionToDelete] = useState<Submission | null>(null);
+    const [deletingSubmission, setDeletingSubmission] = useState(false);
+    const [submissionDeleteError, setSubmissionDeleteError] = useState('');
+    const [deleteAnnouncement, setDeleteAnnouncement] = useState('');
 
-    const loadAssignments = async () => {
+    const loadAssignments = useCallback(async () => {
         try {
             const response = await assignmentsAPI.list();
             setAssignments(response.data);
-        } catch (err) {
-            console.error('Failed to load assignments', err);
+        } catch {
+            console.error('Failed to load assignments');
         }
-    };
+    }, []);
 
-    const loadSubmissions = async () => {
+    const loadSubmissions = useCallback(async () => {
         try {
             setLoading(true);
             const response = await submissionsAPI.listSubmissions(user?.id);
             setSubmissions(response.data);
-        } catch (err) {
-            console.error('Failed to load submissions', err);
+        } catch {
+            console.error('Failed to load submissions');
         } finally {
             setLoading(false);
         }
-    };
+    }, [user]);
 
     useEffect(() => {
-        loadSubmissions();
-        loadAssignments();
-    }, []);
+        const timer = window.setTimeout(() => {
+            void loadSubmissions();
+            void loadAssignments();
+        }, 0);
+        return () => window.clearTimeout(timer);
+    }, [loadAssignments, loadSubmissions]);
 
     const handleUploadSuccess = (closeUpload = true) => {
         if (closeUpload) {
@@ -61,6 +70,35 @@ export default function StudentDashboard() {
             setSubmissionToReplace(undefined);
         }
         loadSubmissions();
+    };
+
+    const canDeleteSubmission = (submission: Submission) => {
+        if (
+            submission.status === 'processing'
+            || submission.evaluation?.total_score != null
+            || submission.evaluation?.is_reviewed
+            || submission.assignment?.is_active === false
+        ) return false;
+        return true;
+    };
+
+    const deleteSubmission = async () => {
+        if (!submissionToDelete || deletingSubmission) return;
+        setDeletingSubmission(true);
+        setSubmissionDeleteError('');
+        try {
+            const deletedId = submissionToDelete.id;
+            await submissionsAPI.remove(deletedId);
+            setSubmissions((current) => current.filter((submission) => submission.id !== deletedId));
+            setSelectedSubmission((current) => current?.id === deletedId ? null : current);
+            setSubmissionToDelete(null);
+            setDeleteAnnouncement('Submission deleted. Your assigned topic remains available.');
+            await Promise.all([loadSubmissions(), loadAssignments()]);
+        } catch (requestError) {
+            setSubmissionDeleteError(getApiErrorMessage(requestError));
+        } finally {
+            setDeletingSubmission(false);
+        }
     };
 
     const filteredSubmissions = useMemo(
@@ -83,7 +121,7 @@ export default function StudentDashboard() {
         ? evaluatedSubmissions.reduce((acc, s) => acc + (s.evaluation?.total_score ?? 0), 0) / evaluatedSubmissions.length
         : 0;
     const topScore = evaluatedSubmissions.length ? Math.max(...evaluatedSubmissions.map((s) => s.evaluation?.total_score ?? 0)) : 0;
-    const reviewedCount = submissions.filter((s) => s.evaluation?.is_reviewed).length;
+    const reviewedCount = evaluatedSubmissions.filter((s) => s.evaluation?.is_reviewed).length;
 
     return (
         <div className="min-h-screen bg-slate-50 dark:bg-slate-900 text-foreground">
@@ -120,8 +158,24 @@ export default function StudentDashboard() {
                         accent="emerald"
                     />
                     <StatCard label="Top score" value={evaluatedSubmissions.length ? `${topScore.toFixed(1)}%` : 'N/A'} accent="amber" />
-                    <StatCard label="Reviewed by teacher" value={`${reviewedCount}/${submissions.length}`} accent="violet" />
+                    <StatCard label="Reviewed by teacher" value={`${reviewedCount}/${evaluatedSubmissions.length}`} accent="violet" />
                 </div>
+
+                {assignments.some((assignment) => assignment.student_topic?.trim()) && (
+                    <section aria-labelledby="student-topics-heading" className="space-y-3">
+                        <h2 id="student-topics-heading" className="text-lg font-bold text-foreground">Your assigned topics</h2>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            {assignments.filter((assignment) => assignment.student_topic?.trim()).map((assignment) => (
+                                <Card key={assignment.id} className="p-4">
+                                    <h3 className="font-semibold text-foreground">{assignment.title}</h3>
+                                    <p className="mt-1 text-sm text-muted-foreground">
+                                        <span className="font-medium text-foreground">Your topic:</span> {assignment.student_topic}
+                                    </p>
+                                </Card>
+                            ))}
+                        </div>
+                    </section>
+                )}
 
                 <div>
                     {!showUpload ? (
@@ -171,12 +225,9 @@ export default function StudentDashboard() {
                                 className="w-auto"
                                 aria-label="Filter by status"
                             >
-                                <option value="all">All statuses</option>
-                                <option value="ready">Ready</option>
-                                <option value="processing">Processing</option>
-                                <option value="uploaded">Uploaded</option>
-                                <option value="failed">Failed</option>
-                                <option value="needs_attention">Needs attention</option>
+                                {statusFilters.map((status) => (
+                                    <option key={status} value={status}>{getSubmissionStatusLabel(status)}</option>
+                                ))}
                             </Select>
                             <Button variant="outline" size="sm" onClick={loadSubmissions} title="Refresh">
                                 <RefreshCw className="h-4 w-4" />
@@ -214,25 +265,36 @@ export default function StudentDashboard() {
                                                 {(() => {
                                                     const displayStatus = (submission.evaluation && submission.status === 'failed') ? 'ready' : submission.status;
                                                     return (
-                                                        <Badge className={getStatusBadgeClasses(displayStatus)}>
-                                                            {displayStatus === 'needs_attention' ? 'Needs attention' : displayStatus}
+                                                        <Badge className={getStatusBadgeClasses(displayStatus)} aria-live="polite">
+                                                            {getSubmissionStatusLabel(displayStatus)}
                                                         </Badge>
                                                     );
                                                 })()}
+                                                {submission.source === 'teacher_upload' && (
+                                                    <Badge variant="info">Uploaded by your teacher</Badge>
+                                                )}
                                                 {submission.evaluation?.is_reviewed && (
                                                     <Badge variant="info">Teacher reviewed</Badge>
                                                 )}
                                             </div>
-                                            <p className="text-xs text-muted-foreground truncate">
-                                                {submissionFileName(submission)} · {submission.file_type.toUpperCase()}
-                                            </p>
+                                            {(submissionFileName(submission) || submission.file_type) && (
+                                                <p className="text-xs text-muted-foreground truncate">
+                                                    {submissionFileName(submission)}
+                                                    {submission.file_type ? ` · ${submission.file_type.toUpperCase()}` : ''}
+                                                </p>
+                                            )}
                                             <p className="text-xs text-muted-foreground">
                                                 Submitted {formatDateTime(submission.created_at)}
                                             </p>
+                                            {submission.student_topic && (
+                                                <p className="text-xs text-muted-foreground">
+                                                    <span className="font-semibold text-foreground">Your topic:</span> {submission.student_topic}
+                                                </p>
+                                            )}
                                         </div>
 
                                         <div className="flex items-center gap-6 shrink-0">
-                                            {submission.evaluation?.total_score !== undefined && (
+                                            {submission.status !== 'pending_teacher_review' && submission.evaluation?.total_score != null && (
                                                 <div className="text-right">
                                                     <div className="flex items-baseline gap-2">
                                                         <span className="text-3xl font-extrabold text-foreground">
@@ -248,7 +310,7 @@ export default function StudentDashboard() {
                                                         </span>
                                                     </div>
                                                     <p className="text-xs text-muted-foreground mt-0.5">
-                                                        AI confidence: {(submission.evaluation.ai_confidence * 100).toFixed(0)}%
+                                                        AI confidence: {((submission.evaluation.ai_confidence ?? 0) * 100).toFixed(0)}%
                                                     </p>
                                                 </div>
                                             )}
@@ -260,7 +322,7 @@ export default function StudentDashboard() {
                                                     setSelectedSubmission(submission);
                                                 }}
                                             >
-                                                View evaluation
+                                                {submission.status === 'pending_teacher_review' ? 'Why can’t I see results?' : 'View evaluation'}
                                             </Button>
                                             {submission.status === 'needs_attention' && (
                                                 <Button
@@ -273,6 +335,20 @@ export default function StudentDashboard() {
                                                     }}
                                                 >
                                                     Replace file
+                                                </Button>
+                                            )}
+                                            {canDeleteSubmission(submission) && (
+                                                <Button
+                                                    variant="destructive"
+                                                    size="sm"
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        setSubmissionDeleteError('');
+                                                        setSubmissionToDelete(submission);
+                                                    }}
+                                                >
+                                                    <Trash2 className="h-4 w-4" />
+                                                    Delete submission
                                                 </Button>
                                             )}
                                         </div>
@@ -290,20 +366,23 @@ export default function StudentDashboard() {
                 title={selectedSubmission ? getSubmissionDisplayTitle(selectedSubmission) : ''}
                 subtitle={
                     selectedSubmission &&
-                    `Submitted ${formatDateTime(selectedSubmission.created_at)} · ${submissionFileName(selectedSubmission)}`
+                    `Submitted ${formatDateTime(selectedSubmission.created_at)}${submissionFileName(selectedSubmission) ? ` · ${submissionFileName(selectedSubmission)}` : ''}`
                 }
                 footer={
                     <>
-                        <Button variant="outline" onClick={() => window.print()}>
-                            <Printer className="h-4 w-4" />
-                            Print / save PDF
-                        </Button>
+                        {selectedSubmission?.status !== 'pending_teacher_review' && (
+                            <Button variant="outline" onClick={() => window.print()}>
+                                <Printer className="h-4 w-4" />
+                                Print / save PDF
+                            </Button>
+                        )}
                         <Button onClick={() => setSelectedSubmission(null)}>Close</Button>
                     </>
                 }
             >
                 {selectedSubmission && (
                     <>
+                        {selectedSubmission.status !== 'pending_teacher_review' && (
                         <div className="flex border-b border-border bg-muted/40 px-6 pt-3">
                             <button
                                 onClick={() => setActiveTab('feedback')}
@@ -326,8 +405,15 @@ export default function StudentDashboard() {
                                 Extracted content
                             </button>
                         </div>
+                        )}
 
                         <div className="p-6 space-y-6">
+                            {selectedSubmission.status === 'pending_teacher_review' ? (
+                                <Alert variant="info">
+                                    Your teacher is reviewing this submission. Results will appear here once released.
+                                </Alert>
+                            ) : (
+                                <>
                             {selectedSubmission.verification_verdict && (
                                 <Alert variant={
                                     selectedSubmission.verification_verdict === 'mismatch' || selectedSubmission.verification_verdict === 'unreadable_or_empty'
@@ -369,7 +455,7 @@ export default function StudentDashboard() {
                                                 <p className="text-xs font-semibold text-muted-foreground uppercase">Total score</p>
                                                 <div className="flex items-baseline gap-2 mt-1">
                                                     <span className="text-3xl font-black text-indigo-600 dark:text-indigo-400">
-                                                        {selectedSubmission.evaluation.total_score.toFixed(1)}
+                                                        {selectedSubmission.evaluation.total_score?.toFixed(1) ?? 'N/A'}
                                                     </span>
                                                     <span className="text-sm font-medium text-muted-foreground">/ {selectedSubmission.assignment?.max_score ?? 100}</span>
                                                 </div>
@@ -383,7 +469,7 @@ export default function StudentDashboard() {
                                             <div>
                                                 <p className="text-xs font-semibold text-muted-foreground uppercase">AI confidence</p>
                                                 <p className="text-3xl font-black text-emerald-600 dark:text-emerald-400 mt-1">
-                                                    {(selectedSubmission.evaluation.ai_confidence * 100).toFixed(0)}%
+                                                    {((selectedSubmission.evaluation.ai_confidence ?? 0) * 100).toFixed(0)}%
                                                 </p>
                                             </div>
                                         </div>
@@ -434,14 +520,30 @@ export default function StudentDashboard() {
                                             {selectedSubmission.extracted_code || selectedSubmission.extracted_text}
                                         </pre>
                                     ) : (
-                                        <p className="text-sm text-muted-foreground italic">No text content was extracted for this submission.</p>
+                                        <p className="text-sm text-muted-foreground italic">Not available</p>
                                     )}
                                 </div>
+                            )}
+                                </>
                             )}
                         </div>
                     </>
                 )}
             </Modal>
+            <p className="sr-only" aria-live="polite" aria-atomic="true">{deleteAnnouncement}</p>
+            <ConfirmDeleteModal
+                key={`${submissionToDelete?.id ?? 'closed'}-${submissionToDelete !== null}`}
+                open={submissionToDelete !== null}
+                onClose={() => {
+                    if (!deletingSubmission) setSubmissionToDelete(null);
+                }}
+                onConfirm={() => void deleteSubmission()}
+                title="Delete submission?"
+                description="This removes your submitted work. You can submit again before the deadline."
+                confirmLabel="Delete submission"
+                busy={deletingSubmission}
+                error={submissionDeleteError || undefined}
+            />
         </div>
     );
 }

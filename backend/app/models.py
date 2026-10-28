@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     JSON,
     String,
+    SmallInteger,
     Text,
     false,
     func,
@@ -20,7 +21,9 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy import event
 from app.database import Base
+from app.services.roster_cells import normalize_roll_no
 
 
 JSON_LIST_TYPE = MutableList.as_mutable(JSON().with_variant(JSONB(), "postgresql"))
@@ -41,6 +44,42 @@ class SubmissionStatus(str, enum.Enum):
     NEEDS_ATTENTION = "needs_attention"
 
 
+class SubmissionSource(str, enum.Enum):
+    STUDENT_UPLOAD = "student_upload"
+    TEACHER_UPLOAD = "teacher_upload"
+
+
+class UploadBatchStatus(str, enum.Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class UploadBatchFileStatus(str, enum.Enum):
+    UPLOADED = "uploaded"
+    PROCESSING = "processing"
+    PARSED = "parsed"
+    NAME_DETECTED = "name_detected"
+    MATCHED = "matched"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
+    GRADING = "grading"
+    GRADED = "graded"
+    NEEDS_ATTENTION = "needs_attention"
+    DUPLICATE = "duplicate"
+    FAILED = "failed"
+    REJECTED = "rejected"
+    ROSTER_DETECTED = "roster_detected"
+    IMPORTED = "imported"
+
+
+class StudentMatchStatus(str, enum.Enum):
+    AUTO_MATCHED = "auto_matched"
+    NEEDS_CONFIRMATION = "needs_confirmation"
+    UNMATCHED = "unmatched"
+    CONFIRMED_BY_TEACHER = "confirmed_by_teacher"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -48,6 +87,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     __table_args__ = (Index("uq_users_email_lower", func.lower(email), unique=True),)
     full_name: Mapped[str] = mapped_column(String(255))
+    roll_no: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255))
     role: Mapped[UserRole] = mapped_column(Enum(UserRole, native_enum=False, length=7), default=UserRole.STUDENT)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
@@ -60,6 +100,12 @@ class User(Base):
     )
     assignments: Mapped[list["Assignment"]] = relationship("Assignment", back_populates="teacher")
     evaluations: Mapped[list["Evaluation"]] = relationship("Evaluation", back_populates="reviewed_by")
+
+
+@event.listens_for(User, "before_insert")
+@event.listens_for(User, "before_update")
+def _normalize_user_roll_no(_mapper, _connection, user: User) -> None:
+    user.roll_no = normalize_roll_no(user.roll_no)
 
 
 class Assignment(Base):
@@ -85,6 +131,98 @@ class Assignment(Base):
 
     teacher: Mapped["User"] = relationship("User", back_populates="assignments")
     submissions: Mapped[list["Submission"]] = relationship("Submission", back_populates="assignment")
+
+
+class AssignmentAssignee(Base):
+    __tablename__ = "assignment_assignees"
+    __table_args__ = (
+        Index(
+            "uq_assignment_assignees_assignment_student",
+            "assignment_id",
+            "student_id",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    assignment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("assignments.id"), nullable=False
+    )
+    student_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    topic_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    topic_number: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    roster_row_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+
+class UploadBatch(Base):
+    __tablename__ = "upload_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    teacher_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    target_assignment_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("assignments.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    file_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[UploadBatchStatus] = mapped_column(
+        Enum(UploadBatchStatus, native_enum=False, length=20),
+        default=UploadBatchStatus.PENDING,
+        nullable=False,
+    )
+
+
+class UploadBatchFile(Base):
+    __tablename__ = "upload_batch_files"
+    __table_args__ = (
+        Index("ix_upload_batch_files_batch_status", "batch_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    batch_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("upload_batches.id"), nullable=False
+    )
+    storage_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[UploadBatchFileStatus] = mapped_column(
+        Enum(UploadBatchFileStatus, native_enum=False, length=32),
+        default=UploadBatchFileStatus.UPLOADED,
+        nullable=False,
+    )
+    detected_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    parsed_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    has_visual_content: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    name_detection: Mapped[Optional[dict]] = mapped_column(JSON_DICT_TYPE, nullable=True)
+    candidates: Mapped[Optional[list]] = mapped_column(JSON_LIST_TYPE, nullable=True)
+    match_status: Mapped[Optional[StudentMatchStatus]] = mapped_column(
+        Enum(StudentMatchStatus, native_enum=False, length=32), nullable=True
+    )
+    resolved_student_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+    resolved_assignment_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("assignments.id"), nullable=True
+    )
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    failed_step: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    submission_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("submissions.id"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
 
 
 class Submission(Base):
@@ -115,6 +253,26 @@ class Submission(Base):
     teacher_override_by: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
     teacher_override_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     teacher_override_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    uploaded_by_teacher_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+    source: Mapped[Optional[SubmissionSource]] = mapped_column(
+        Enum(SubmissionSource, native_enum=False, length=20), nullable=True
+    )
+    upload_batch_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("upload_batches.id"), nullable=True
+    )
+    name_detection: Mapped[Optional[dict]] = mapped_column(JSON_DICT_TYPE, nullable=True)
+    match_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    match_status: Mapped[Optional[StudentMatchStatus]] = mapped_column(
+        Enum(StudentMatchStatus, native_enum=False, length=32), nullable=True
+    )
+    teacher_confirmed_by: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+    teacher_confirmed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -132,6 +290,10 @@ class Submission(Base):
     verification_attempts: Mapped[list["VerificationAttempt"]] = relationship(
         "VerificationAttempt", back_populates="submission", cascade="all, delete-orphan"
     )
+
+    @property
+    def student_name(self) -> Optional[str]:
+        return self.student.full_name if self.student else None
 
 
 class VerificationAttempt(Base):

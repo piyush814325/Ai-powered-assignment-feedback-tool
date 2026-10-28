@@ -3,7 +3,15 @@
  * color mapping can never drift between the student and teacher views.
  */
 
-export type SubmissionStatus = 'ready' | 'processing' | 'uploaded' | 'failed' | string;
+export type SubmissionStatus =
+    | 'all'
+    | 'ready'
+    | 'processing'
+    | 'uploaded'
+    | 'failed'
+    | 'needs_attention'
+    | 'pending_teacher_review'
+    | string;
 
 const GRADE_SCALE = [
     { min: 90, letter: 'A+' },
@@ -34,6 +42,7 @@ const STATUS_STYLES: Record<string, string> = {
     uploaded: 'bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300',
     failed: 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300',
     needs_attention: 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300',
+    pending_teacher_review: 'bg-violet-100 text-violet-800 dark:bg-violet-950/60 dark:text-violet-300',
 };
 
 export function getStatusBadgeClasses(status: SubmissionStatus): string {
@@ -51,7 +60,7 @@ export function formatDate(value: string): string {
     return new Date(value).toLocaleDateString(undefined, { dateStyle: 'medium' });
 }
 
-export function fileName(path: string): string {
+export function fileName(path: string | null | undefined): string {
     if (!path) return '';
     // Handle both Unix (/) and Windows (\) path separators
     const rawName = path.split(/[/\\]/).pop() ?? path;
@@ -59,12 +68,26 @@ export function fileName(path: string): string {
     return rawName.replace(/^\d+(\.\d+)?_/, '');
 }
 
-export function submissionFileName(submission: { file_path: string; original_filename?: string | null }): string {
+export function submissionFileName(submission: { file_path?: string | null; original_filename?: string | null }): string {
     return submission.original_filename || fileName(submission.file_path);
 }
 
-export function getSubmissionDisplayTitle(submission: { assignment_id?: number; assignment?: { title: string }; file_path: string; original_filename?: string | null }): string {
+export function getSubmissionDisplayTitle(submission: { assignment_id?: number; assignment?: { title: string }; file_path?: string | null; original_filename?: string | null }): string {
     if (submission.assignment?.title) return submission.assignment.title;
     const cleanName = submissionFileName(submission);
     return cleanName || 'Assignment Submission';
+}
+
+const SUBMISSION_STATUS_LABELS: Record<string, string> = {
+    all: 'All statuses',
+    ready: 'Ready',
+    processing: 'Processing',
+    uploaded: 'Uploaded',
+    failed: 'Failed',
+    needs_attention: 'Needs attention',
+    pending_teacher_review: 'Pending teacher review',
+};
+
+export function getSubmissionStatusLabel(status: SubmissionStatus): string {
+    return SUBMISSION_STATUS_LABELS[status] ?? 'Processing';
 }

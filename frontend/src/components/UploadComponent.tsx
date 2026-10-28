@@ -140,6 +140,7 @@ export default function UploadComponent({ assignments, onSuccess, submissionToRe
                 return <div className="rounded-md border border-border bg-muted/30 p-3 text-sm">
                     <p className="font-semibold text-foreground">{assignment.title}</p>
                     <p className="mt-1 text-muted-foreground">{assignment.description || 'No additional instructions.'}</p>
+                    {assignment.student_topic && <p className="mt-2 text-muted-foreground"><span className="font-semibold text-foreground">Your topic:</span> {assignment.student_topic}</p>}
                     {assignment.due_date && <p className="mt-1 text-muted-foreground">Due {new Date(assignment.due_date).toLocaleString()}</p>}
                 </div>;
             })()}

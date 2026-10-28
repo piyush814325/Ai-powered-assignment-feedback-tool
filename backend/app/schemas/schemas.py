@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -24,6 +24,7 @@ class UserCreate(BaseModel):
     full_name: str
     password: str
     role: UserRole = UserRole.STUDENT
+    roll_no: Optional[str] = Field(default=None, max_length=50)
 
 
 class UserLogin(BaseModel):
@@ -32,16 +33,15 @@ class UserLogin(BaseModel):
 
 
 class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     email: str
     full_name: str
+    roll_no: Optional[str] = None
     role: UserRole
     is_active: bool
     created_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -82,6 +82,8 @@ class AssignmentUpdate(BaseModel):
 
 
 class AssignmentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     teacher_id: int
     subject_name: str
@@ -93,13 +95,10 @@ class AssignmentResponse(BaseModel):
     allowed_file_types: List[str]
     rubric: List[RubricCriterion]
     is_active: bool
+    student_topic: Optional[str] = None
     submission_count: int = 0
     created_at: datetime
     updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 # Submission Schemas
 class SubmissionCreate(BaseModel):
@@ -107,14 +106,18 @@ class SubmissionCreate(BaseModel):
 
 
 class SubmissionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     student_id: int
+    student_name: Optional[str] = None
     assignment_id: int
     assignment: Optional[AssignmentResponse] = None
-    file_path: str
+    file_path: Optional[str]
     original_filename: Optional[str] = None
     file_type: str
-    status: SubmissionStatus
+    status: str
+    source: Optional[str] = None
     extracted_text: Optional[str] = None
     extracted_code: Optional[str] = None
     content_hash: Optional[str] = None
@@ -122,6 +125,7 @@ class SubmissionResponse(BaseModel):
     verification_confidence: Optional[float] = None
     verification_detected_topic: Optional[str] = None
     verification_expected_topic: Optional[str] = None
+    student_topic: Optional[str] = None
     verification_reasons: Optional[List[str]] = None
     verification_missing_requirements: Optional[List[str]] = None
     verification_model: Optional[str] = None
@@ -132,10 +136,6 @@ class SubmissionResponse(BaseModel):
     teacher_override_reason: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 class SubmissionWithEvaluation(SubmissionResponse):
     evaluation: Optional["EvaluationResponse"] = None
@@ -169,6 +169,8 @@ class FeedbackItemResponse(BaseModel):
 
 
 class EvaluationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     submission_id: int
     rubric_id: int
@@ -181,10 +183,6 @@ class EvaluationResponse(BaseModel):
     is_reviewed: bool
     created_at: datetime
     updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 class EvaluationCreate(BaseModel):
     submission_id: int
@@ -218,6 +216,8 @@ class RubricCreate(BaseModel):
 
 
 class RubricResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     description: str
@@ -225,10 +225,6 @@ class RubricResponse(BaseModel):
     criteria: List[RubricCriterion]
     is_active: bool
     created_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 # Document Parsing Response
 class ParsedDocumentResponse(BaseModel):

@@ -166,9 +166,17 @@ class SubmissionVerificationService:
         has_images: bool = False,
         use_mock: bool = False,
         wrong_assignment_evidence: bool = False,
+        student_topic: str | None = None,
     ) -> dict[str, Any]:
         normalized = SubmissionVerificationService.normalize_content(content, None)
-        expected_topic = f"{assignment.subject_name}: {assignment.title}"
+        expected_assignment_topic = (
+            student_topic.strip()
+            if student_topic and student_topic.strip()
+            else assignment.title
+        )
+        expected_topic = f"{assignment.subject_name}: {expected_assignment_topic}"
+        if assignment.description and assignment.description.strip():
+            expected_topic = f"{expected_topic}\n{assignment.description.strip()}"
         if len(normalized) < VERIFICATION_MIN_CONTENT_CHARS:
             verdict = "unverifiable" if has_images else "unreadable_or_empty"
             reason = (

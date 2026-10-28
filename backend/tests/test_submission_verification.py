@@ -8,9 +8,19 @@ from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
+from uuid import uuid4
 
 from app.database import Base
-from app.models import Assignment, Evaluation, Submission, SubmissionStatus, User, UserRole
+from app.models import (
+    Assignment,
+    AssignmentAssignee,
+    Evaluation,
+    Rubric,
+    Submission,
+    SubmissionStatus,
+    User,
+    UserRole,
+)
 from app.routers import submissions as submission_router
 from app.schemas.schemas import VerificationOverrideRequest
 from app.services import document_parser, verification_service
@@ -28,6 +38,14 @@ def db():
     )
     Base.metadata.create_all(bind=engine)
     session = Session(engine)
+    rubric = Rubric(
+        name="Verification test rubric",
+        description="Fixture rubric",
+        total_points=100,
+        criteria=[{"id": "correctness", "name": "Correctness", "weight": 1, "max_points": 100}],
+    )
+    session.add(rubric)
+    session.commit()
     try:
         yield session
     finally:
@@ -36,15 +54,16 @@ def db():
         engine.dispose()
 
 
-def setup_assignment(db, assignment_id=1):
+def setup_assignment(db):
+    unique_suffix = uuid4().hex
     teacher = User(
-        email=f"teacher{assignment_id}@example.test",
+        email=f"teacher-{unique_suffix}@example.test",
         full_name="Teacher",
         hashed_password="hash",
         role=UserRole.TEACHER,
     )
     student = User(
-        email=f"student{assignment_id}@example.test",
+        email=f"student-{unique_suffix}@example.test",
         full_name="Student",
         hashed_password="hash",
         role=UserRole.STUDENT,
@@ -52,10 +71,9 @@ def setup_assignment(db, assignment_id=1):
     db.add_all([teacher, student])
     db.flush()
     assignment = Assignment(
-        id=assignment_id,
         teacher_id=teacher.id,
         subject_name="Data Structures",
-        subject_code=f"CS{assignment_id}",
+        subject_code=f"CS{unique_suffix[:8]}",
         title="Implement a binary search tree",
         description="Implement insertion and lookup in a binary search tree.",
         max_score=100,
@@ -66,6 +84,10 @@ def setup_assignment(db, assignment_id=1):
     db.add(assignment)
     db.commit()
     return teacher, student, assignment
+
+
+def _rubric_id(db):
+    return db.query(Rubric.id).one()[0]
 
 
 def create_submission(db, student, assignment, *, status=SubmissionStatus.UPLOADED, content_hash=None):
@@ -137,13 +159,78 @@ def test_empty_content_is_unreadable_without_llm(db, monkeypatch):
     assert result["verdict"] == "unreadable_or_empty"
 
 
+@pytest.mark.parametrize(
+    ("student_topic", "expected"),
+    [
+        (
+            "  Individual Project Topic  ",
+            "Data Structures: Individual Project Topic\n"
+            "Implement insertion and lookup in a binary search tree.",
+        ),
+        (
+            None,
+            "Data Structures: Implement a binary search tree\n"
+            "Implement insertion and lookup in a binary search tree.",
+        ),
+    ],
+)
+def test_verification_expected_topic_uses_student_topic_or_assignment_fallback(
+    db, student_topic, expected
+):
+    _, _, assignment = setup_assignment(db)
+
+    result = asyncio.run(
+        SubmissionVerificationService.verify(
+            assignment,
+            "A sufficiently long explanation for the expected assignment topic.",
+            use_mock=True,
+            student_topic=student_topic,
+        )
+    )
+
+    assert result["expected_topic"] == expected
+
+
+def test_submission_verification_loads_only_the_assigned_students_topic(db, monkeypatch):
+    _, student, assignment = setup_assignment(db)
+    submission = create_submission(db, student, assignment)
+    db.add(
+        AssignmentAssignee(
+            assignment_id=assignment.id,
+            student_id=student.id,
+            topic_text="Student-specific topic",
+        )
+    )
+    db.commit()
+    stub_pipeline(monkeypatch, "A long enough sample for topic verification to proceed.")
+    observed = {}
+
+    async def verify(*_args, **kwargs):
+        observed.update(kwargs)
+        return {
+            "verdict": "unverified",
+            "confidence": None,
+            "detected_topic": "",
+            "expected_topic": kwargs["student_topic"],
+            "reasons": [],
+            "missing_requirements": [],
+            "model": "mock",
+        }
+
+    monkeypatch.setattr(SubmissionVerificationService, "verify", verify)
+    asyncio.run(submission_router._verify_submission_file(submission, db, True))
+
+    assert observed["student_topic"] == "Student-specific topic"
+
+
 def test_right_topic_weak_submission_is_graded(db, monkeypatch):
     _, student, assignment = setup_assignment(db)
     submission = create_submission(db, student, assignment)
     stub_pipeline(monkeypatch)
     set_verdict(monkeypatch, "match", confidence=0.95)
 
-    result = asyncio.run(submission_router._evaluate_submission(submission.id, 1, True, db))
+    rubric_id = _rubric_id(db)
+    result = asyncio.run(submission_router._evaluate_submission(submission.id, rubric_id, True, db))
 
     assert result["status"] == SubmissionStatus.READY
     assert result["evaluation"].total_score == 10
@@ -155,7 +242,8 @@ def test_confident_mismatch_is_held_before_classification(db, monkeypatch):
     stub_pipeline(monkeypatch)
     set_verdict(monkeypatch, "mismatch", confidence=0.95)
 
-    result = asyncio.run(submission_router._evaluate_submission(submission.id, 1, True, db))
+    rubric_id = _rubric_id(db)
+    result = asyncio.run(submission_router._evaluate_submission(submission.id, rubric_id, True, db))
 
     assert result["status"] == SubmissionStatus.NEEDS_ATTENTION
     assert result["evaluation"] is None
@@ -163,7 +251,7 @@ def test_confident_mismatch_is_held_before_classification(db, monkeypatch):
 
 
 def test_same_content_on_another_assignment_is_evidence(db, monkeypatch):
-    teacher, student, assignment_one = setup_assignment(db, 1)
+    teacher, student, assignment_one = setup_assignment(db)
     assignment_two = Assignment(
         teacher_id=teacher.id,
         subject_name="Databases",
@@ -197,7 +285,7 @@ def test_same_content_on_another_assignment_is_evidence(db, monkeypatch):
         }
 
     monkeypatch.setattr(SubmissionVerificationService, "verify", verify)
-    asyncio.run(submission_router._evaluate_submission(new_submission.id, 1, True, db))
+    asyncio.run(submission_router._evaluate_submission(new_submission.id, _rubric_id(db), True, db))
     assert observed["wrong_assignment_evidence"] is True
 
 
@@ -267,7 +355,7 @@ def test_verifier_failure_fails_open_and_grading_continues(db, monkeypatch, capl
             raise httpx.TimeoutException("timeout")
 
     monkeypatch.setattr(verification_service.httpx, "AsyncClient", TimeoutClient)
-    result = asyncio.run(submission_router._evaluate_submission(submission.id, 1, False, db))
+    result = asyncio.run(submission_router._evaluate_submission(submission.id, _rubric_id(db), False, db))
 
     assert result["status"] == SubmissionStatus.READY
     assert result["verification_verdict"] == "unverified"
@@ -345,7 +433,7 @@ def test_partial_or_low_confidence_mismatch_is_graded(db, monkeypatch, verdict, 
     stub_pipeline(monkeypatch)
     set_verdict(monkeypatch, verdict, confidence)
 
-    result = asyncio.run(submission_router._evaluate_submission(submission.id, 1, True, db))
+    result = asyncio.run(submission_router._evaluate_submission(submission.id, _rubric_id(db), True, db))
 
     assert result["status"] == SubmissionStatus.READY
     assert result["evaluation"] is not None
@@ -361,7 +449,7 @@ def test_same_assignment_duplicate_is_flagged_but_graded(db, monkeypatch):
     stub_pipeline(monkeypatch, content)
     set_verdict(monkeypatch, "match")
 
-    result = asyncio.run(submission_router._evaluate_submission(submission.id, 1, True, db))
+    result = asyncio.run(submission_router._evaluate_submission(submission.id, _rubric_id(db), True, db))
 
     assert result["verification_verdict"] == "duplicate_submission"
     assert result["status"] == SubmissionStatus.READY
@@ -377,7 +465,7 @@ def test_unusable_scanned_ocr_is_unverifiable_but_graded(db, monkeypatch):
         "parse_document",
         lambda *_args: ("", None, ["data:image/png;base64,"], "pdf"),
     )
-    result = asyncio.run(submission_router._evaluate_submission(submission.id, 1, True, db))
+    result = asyncio.run(submission_router._evaluate_submission(submission.id, _rubric_id(db), True, db))
     assert result["verification_verdict"] == "unverifiable"
     assert result["status"] == SubmissionStatus.READY
     assert result["evaluation"] is not None
@@ -503,7 +591,7 @@ def test_teacher_rerun_verification_does_not_grade(db, monkeypatch):
     teacher, student, assignment = setup_assignment(db)
     submission = create_submission(db, student, assignment, status=SubmissionStatus.READY)
     submission.evaluation = Evaluation(
-        rubric_id=1,
+        rubric_id=_rubric_id(db),
         total_score=10,
         scores={"correctness": 10},
         feedback={"correctness": "Previously graded."},

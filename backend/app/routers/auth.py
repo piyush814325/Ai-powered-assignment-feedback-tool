@@ -6,6 +6,7 @@ from datetime import timedelta
 from app.database import get_db
 from app.schemas.schemas import UserCreate, UserLogin, UserResponse, TokenResponse
 from app.models import User
+from app.services.roster_cells import normalize_roll_no
 from app.services.auth_service import (
     verify_password, get_password_hash, create_access_token,
     decode_token, ACCESS_TOKEN_EXPIRE_MINUTES
@@ -31,7 +32,8 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
         email=normalized_email,
         full_name=user.full_name,
         hashed_password=hashed_password,
-        role=user.role
+        role=user.role,
+        roll_no=normalize_roll_no(user.roll_no),
     )
     db.add(new_user)
     db.commit()

@@ -1,13 +1,26 @@
 import logging
 from time import perf_counter
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File, Form, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import Optional
 from datetime import timedelta
 from app.database import get_db
-from app.models import Assignment, Submission, Evaluation, User, SubmissionStatus, Rubric, VerificationAttempt
+from app.models import (
+    Assignment,
+    AssignmentAssignee,
+    Evaluation,
+    Feedback,
+    Rubric,
+    Submission,
+    SubmissionStatus,
+    UploadBatch,
+    UploadBatchFile,
+    UploadBatchStatus,
+    User,
+    VerificationAttempt,
+)
 from app.schemas.schemas import (
     SubmissionResponse,
     SubmissionWithEvaluation,
@@ -30,19 +43,17 @@ from app.config import (
 )
 from pathlib import Path
 from datetime import datetime, timezone
-from app.services.file_storage import get_storage
+from app.services.file_storage import delete_storage_objects, get_storage
+from app.models import SubmissionSource
+from app.services.excel_parser import parse_excel
 
 router = APIRouter(prefix="/submissions", tags=["submissions"])
+student_router = APIRouter(prefix="/student/submissions", tags=["student submissions"])
 logger = logging.getLogger(__name__)
 
 
-from fastapi.security import OAuth2PasswordBearer
 from app.routers.auth import get_current_user, require_teacher
-from app.services.auth_service import decode_token
 from sqlalchemy import func
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
-
 
 @router.post("/upload", response_model=SubmissionResponse)
 async def upload_submission(
@@ -58,10 +69,17 @@ async def upload_submission(
 
     assignment = db.query(Assignment).filter(
         Assignment.id == assignment_id,
-        Assignment.is_active.is_(True),
     ).first()
     if not assignment:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Assignment is not active or does not exist")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Assignment not found.",
+        )
+    if not assignment.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This assignment is inactive and no longer accepts submissions.",
+        )
 
     now = datetime.now(timezone.utc)
     if assignment.due_date:
@@ -81,7 +99,8 @@ async def upload_submission(
         file_path=file_path,
         original_filename=file_name,
         file_type=file_type,
-        status=SubmissionStatus.UPLOADED
+        status=SubmissionStatus.UPLOADED,
+        source=SubmissionSource.STUDENT_UPLOAD,
     )
     
     db.add(submission)
@@ -170,10 +189,16 @@ async def _verify_submission_file(
     if submission.file_path is None:
         raise ValueError("Submission has no file path")
     content = await run_in_threadpool(get_storage().read, submission.file_path)
-    text, code, images, file_type = DocumentParser.parse_document(
-        content,
-        submission.file_path,
-    )
+    if submission.source == SubmissionSource.TEACHER_UPLOAD:
+        parsed = parse_excel(content, submission.original_filename or submission.file_path)
+        text, code = parsed.text, None
+        images = ["spreadsheet_visual_content"] if parsed.has_visual_content else None
+        file_type = "spreadsheet"
+    else:
+        text, code, images, file_type = DocumentParser.parse_document(
+            content,
+            submission.file_path,
+        )
     submission.extracted_text = text
     submission.extracted_code = code
     submission.file_type = file_type
@@ -206,12 +231,17 @@ async def _verify_submission_file(
     if code and code != text:
         verification_content = f"{verification_content}\n{code}"
     verification_started = perf_counter()
+    assignee = db.query(AssignmentAssignee).filter(
+        AssignmentAssignee.assignment_id == submission.assignment_id,
+        AssignmentAssignee.student_id == submission.student_id,
+    ).first()
     verification = await SubmissionVerificationService.verify(
         submission.assignment,
         verification_content,
         has_images=bool(images),
         use_mock=use_mock_llm,
         wrong_assignment_evidence=wrong_assignment_evidence,
+        student_topic=assignee.topic_text if assignee else None,
     )
     if same_assignment_duplicate and verification["verdict"] == "match":
         verification["verdict"] = "duplicate_submission"
@@ -252,7 +282,12 @@ async def _evaluate_submission(
     record_attempt: bool = True,
 ) -> dict:
     evaluation_started = perf_counter()
-    submission = db.query(Submission).filter(Submission.id == submission_id).first()
+    submission = (
+        db.query(Submission)
+        .filter(Submission.id == submission_id)
+        .with_for_update()
+        .first()
+    )
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
 
@@ -402,6 +437,11 @@ async def evaluate_submission(
         raise HTTPException(status_code=404, detail="Submission not found")
     if current_user.role.value == "student" and submission.student_id != current_user.id:
         raise HTTPException(status_code=403, detail="You can only evaluate your own submission")
+    if (
+        current_user.role.value == "student"
+        and submission.source == SubmissionSource.TEACHER_UPLOAD
+    ):
+        raise HTTPException(status_code=403, detail="Teacher-uploaded submissions are evaluated by the teacher")
     if current_user.role.value == "teacher" and submission.assignment.teacher_id != current_user.id:
         raise HTTPException(status_code=403, detail="You can only evaluate submissions for your assignments")
     return await _evaluate_submission(
@@ -413,6 +453,138 @@ async def evaluate_submission(
     )
 
 
+@student_router.delete("/{submission_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_student_submission(
+    submission_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role.value != "student":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only students can delete their own submissions.",
+        )
+    submission = (
+        db.query(Submission)
+        .filter(
+            Submission.id == submission_id,
+            Submission.student_id == current_user.id,
+        )
+        .with_for_update()
+        .first()
+    )
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if submission.status == SubmissionStatus.PROCESSING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This submission is being graded and cannot be deleted yet.",
+        )
+    evaluation = db.query(Evaluation).filter(
+        Evaluation.submission_id == submission.id
+    ).first()
+    if evaluation and (
+        evaluation.total_score is not None or evaluation.is_reviewed
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This submission has been graded and cannot be deleted.",
+        )
+    assignment = db.query(Assignment).filter(
+        Assignment.id == submission.assignment_id
+    ).first()
+    now = datetime.now(timezone.utc)
+    if assignment and (
+        not assignment.is_active
+        or (
+            assignment.due_date is not None
+            and now
+            > (
+                assignment.due_date.replace(tzinfo=timezone.utc)
+                if assignment.due_date.tzinfo is None
+                else assignment.due_date
+            )
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This assignment is locked, so the submission can no longer be deleted.",
+        )
+
+    batch_files = (
+        db.query(UploadBatchFile)
+        .filter(UploadBatchFile.submission_id == submission.id)
+        .with_for_update()
+        .all()
+    )
+    batch_ids = {batch_file.batch_id for batch_file in batch_files}
+    for batch_id in batch_ids:
+        batch = (
+            db.query(UploadBatch)
+            .filter(UploadBatch.id == batch_id)
+            .with_for_update()
+            .first()
+        )
+        if batch and batch.status == UploadBatchStatus.PROCESSING:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This submission is still being processed by its upload batch.",
+            )
+
+    file_keys = {
+        key
+        for key in (
+            submission.file_path,
+            *(batch_file.storage_key for batch_file in batch_files),
+        )
+        if key
+    }
+    try:
+        if evaluation:
+            db.query(Feedback).filter(
+                Feedback.evaluation_id == evaluation.id
+            ).delete(synchronize_session=False)
+            db.delete(evaluation)
+        db.query(VerificationAttempt).filter(
+            VerificationAttempt.submission_id == submission.id
+        ).delete(synchronize_session=False)
+        db.query(UploadBatchFile).filter(
+            UploadBatchFile.submission_id == submission.id
+        ).delete(synchronize_session=False)
+        db.delete(submission)
+        for batch_id in batch_ids:
+            batch = db.query(UploadBatch).filter(UploadBatch.id == batch_id).first()
+            if batch:
+                batch.file_count = db.query(func.count(UploadBatchFile.id)).filter(
+                    UploadBatchFile.batch_id == batch_id
+                ).scalar() or 0
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        logger.error(
+            "Submission deletion transaction failed: exception_type=%s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not delete the submission.",
+        ) from error
+
+    if file_keys:
+        try:
+            delete_storage_objects(get_storage(), file_keys)
+        except Exception as error:
+            logger.error(
+                "Submission file cleanup failed: exception_type=%s",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="The submission was deleted, but some stored files could not be removed.",
+            ) from error
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.post("/{submission_id}/replace", response_model=SubmissionEvaluationResponse)
 async def replace_submission(
     submission_id: int,
@@ -422,6 +594,8 @@ async def replace_submission(
 ):
     submission = db.query(Submission).filter(Submission.id == submission_id).first()
     if not submission or submission.student_id != current_user.id or current_user.role.value != "student":
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if submission.source == SubmissionSource.TEACHER_UPLOAD:
         raise HTTPException(status_code=404, detail="Submission not found")
     if submission.status != SubmissionStatus.NEEDS_ATTENTION:
         raise HTTPException(status_code=400, detail="Only submissions needing attention can be replaced")
@@ -476,6 +650,12 @@ def download_submission_file(
     if not submission or submission.file_path is None:
         raise HTTPException(status_code=404, detail="Submission file not found")
     if current_user.role.value == "student" and submission.student_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Submission file not found")
+    if (
+        current_user.role.value == "student"
+        and submission.source == SubmissionSource.TEACHER_UPLOAD
+        and not (submission.evaluation and submission.evaluation.is_reviewed)
+    ):
         raise HTTPException(status_code=404, detail="Submission file not found")
     if current_user.role.value == "teacher" and submission.assignment.teacher_id != current_user.id:
         raise HTTPException(status_code=404, detail="Submission file not found")
@@ -560,13 +740,24 @@ def get_submission(
         raise HTTPException(status_code=404, detail="Submission not found")
     if current_user.role.value == "teacher" and submission.assignment.teacher_id != current_user.id:
         raise HTTPException(status_code=404, detail="Submission not found")
+
+    if (
+        current_user.role.value == "student"
+        and submission.source == SubmissionSource.TEACHER_UPLOAD
+        and not (submission.evaluation and submission.evaluation.is_reviewed)
+    ):
+        return _student_pending_review_response(
+            submission, _submission_student_topic(submission, db)
+        )
     
     # Self-heal status if evaluation is present but status was marked failed
     if submission.evaluation and submission.status == SubmissionStatus.FAILED:
         submission.status = SubmissionStatus.READY
         db.commit()
 
-    return submission
+    response = SubmissionWithEvaluation.model_validate(submission).model_dump()
+    response["student_topic"] = _submission_student_topic(submission, db)
+    return response
 
 
 @router.get("/", response_model=list[SubmissionWithEvaluation])
@@ -603,14 +794,62 @@ def list_submissions(
     if changed:
         db.commit()
 
-    return submissions
+    if current_user.role.value == "student":
+        return [
+            _student_pending_review_response(
+                submission, _submission_student_topic(submission, db)
+            )
+            if submission.source == SubmissionSource.TEACHER_UPLOAD
+            and not (submission.evaluation and submission.evaluation.is_reviewed)
+            else _submission_response_with_topic(submission, db)
+            for submission in submissions
+        ]
+    return [_submission_response_with_topic(submission, db) for submission in submissions]
+
+
+def _submission_student_topic(submission: Submission, db: Session) -> str | None:
+    assignee = db.query(AssignmentAssignee.topic_text).filter(
+        AssignmentAssignee.assignment_id == submission.assignment_id,
+        AssignmentAssignee.student_id == submission.student_id,
+    ).scalar()
+    return assignee.strip() if assignee and assignee.strip() else None
+
+
+def _submission_response_with_topic(submission: Submission, db: Session) -> dict:
+    response = SubmissionWithEvaluation.model_validate(submission).model_dump()
+    response["student_topic"] = _submission_student_topic(submission, db)
+    return response
+
+
+def _student_pending_review_response(
+    submission: Submission, student_topic: str | None = None
+) -> dict:
+    response = SubmissionWithEvaluation.model_validate(submission).model_dump()
+    response["status"] = "pending_teacher_review"
+    response["student_topic"] = student_topic
+    response["evaluation"] = None
+    response["file_path"] = None
+    response["original_filename"] = None
+    response["extracted_text"] = None
+    response["extracted_code"] = None
+    response["content_hash"] = None
+    response["verification_reasons"] = None
+    response["verification_missing_requirements"] = None
+    response["verification_detected_topic"] = None
+    response["verification_expected_topic"] = None
+    response["verification_confidence"] = None
+    response["verification_verdict"] = None
+    response["verification_model"] = None
+    response["verification_error_code"] = None
+    response["teacher_override_reason"] = None
+    return response
 
 
 @router.patch("/evaluate/{evaluation_id}/review", response_model=EvaluationResponse)
 def review_evaluation(
     evaluation_id: int,
-    token: Optional[str] = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
+    teacher: User = Depends(require_teacher),
+    db: Session = Depends(get_db),
 ):
     """Mark an evaluation as reviewed by teacher."""
     
@@ -618,15 +857,14 @@ def review_evaluation(
     if not evaluation:
         raise HTTPException(status_code=404, detail="Evaluation not found")
     
-    reviewer_id = None
-    if token:
-        payload = decode_token(token)
-        if payload and "user_id" in payload:
-            reviewer_id = payload["user_id"]
-    
+    if (
+        teacher.role.value != "admin"
+        and evaluation.submission.assignment.teacher_id != teacher.id
+    ):
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
     evaluation.is_reviewed = True
-    if reviewer_id:
-        evaluation.reviewed_by_id = reviewer_id
+    evaluation.reviewed_by_id = teacher.id
         
     db.commit()
     db.refresh(evaluation)
@@ -639,13 +877,18 @@ from app.schemas.schemas import EvaluationUpdate
 def update_evaluation(
     evaluation_id: int,
     eval_update: EvaluationUpdate,
-    token: Optional[str] = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
+    teacher: User = Depends(require_teacher),
+    db: Session = Depends(get_db),
 ):
     """Update evaluation scores & feedback (Teacher override)."""
     
     evaluation = db.query(Evaluation).filter(Evaluation.id == evaluation_id).first()
     if not evaluation:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+    if (
+        teacher.role.value != "admin"
+        and evaluation.submission.assignment.teacher_id != teacher.id
+    ):
         raise HTTPException(status_code=404, detail="Evaluation not found")
     
     if eval_update.scores is not None:
@@ -675,10 +918,7 @@ def update_evaluation(
     if eval_update.is_reviewed is not None:
         evaluation.is_reviewed = eval_update.is_reviewed
         
-    if token:
-        payload = decode_token(token)
-        if payload and "user_id" in payload:
-            evaluation.reviewed_by_id = payload["user_id"]
+    evaluation.reviewed_by_id = teacher.id
 
     db.commit()
     db.refresh(evaluation)

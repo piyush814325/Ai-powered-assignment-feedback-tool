@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useId, useRef } from 'react';
 import { Loader2, X } from 'lucide-react';
 import { cn } from '../lib/utils';
 
@@ -129,7 +129,7 @@ export const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
 );
 Textarea.displayName = 'Textarea';
 
-interface SelectProps extends React.SelectHTMLAttributes<HTMLSelectElement> { }
+type SelectProps = React.SelectHTMLAttributes<HTMLSelectElement>;
 
 export const Select = React.forwardRef<HTMLSelectElement, SelectProps>(
     ({ className, children, ...props }, ref) => (
@@ -240,30 +240,75 @@ interface ModalProps {
     widthClassName?: string;
 }
 
+const modalStack: symbol[] = [];
+let bodyOverflowBeforeModal = '';
+
 /**
- * Accessible dialog: traps focus loosely via autofocus on mount, closes on
- * Escape and backdrop click, and locks body scroll while open.
+ * Accessible dialog that traps focus, restores it on close, and locks body scroll.
  */
 export function Modal({ open, onClose, title, subtitle, children, footer, headerClassName, widthClassName = 'max-w-4xl' }: ModalProps) {
     const closeButtonRef = useRef<HTMLButtonElement>(null);
+    const dialogRef = useRef<HTMLDivElement>(null);
+    const returnFocusRef = useRef<HTMLElement | null>(null);
+    const onCloseRef = useRef(onClose);
+    const modalId = useRef(Symbol('modal'));
+    const titleId = useId();
+    const subtitleId = useId();
+
+    useEffect(() => {
+        onCloseRef.current = onClose;
+    }, [onClose]);
 
     useEffect(() => {
         if (!open) return;
+        const activeModalId = modalId.current;
+        if (modalStack.length === 0) bodyOverflowBeforeModal = document.body.style.overflow;
+        modalStack.push(activeModalId);
+        document.body.style.overflow = 'hidden';
+        returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
         closeButtonRef.current?.focus();
-    }, [open]);
 
-    useEffect(() => {
-        if (!open) return;
         const onKeyDown = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') onClose();
+            if (modalStack.at(-1) !== activeModalId) return;
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
+                onCloseRef.current();
+                return;
+            }
+            if (e.key !== 'Tab') return;
+
+            const focusable = Array.from(
+                dialogRef.current?.querySelectorAll<HTMLElement>(
+                    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+                ) ?? [],
+            ).filter((element) => element.getAttribute('aria-hidden') !== 'true');
+            if (focusable.length === 0) {
+                e.preventDefault();
+                dialogRef.current?.focus();
+                return;
+            }
+
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            const active = document.activeElement;
+            if (e.shiftKey && (active === first || !dialogRef.current?.contains(active))) {
+                e.preventDefault();
+                last.focus();
+            } else if (!e.shiftKey && (active === last || !dialogRef.current?.contains(active))) {
+                e.preventDefault();
+                first.focus();
+            }
         };
         document.addEventListener('keydown', onKeyDown);
-        document.body.style.overflow = 'hidden';
         return () => {
             document.removeEventListener('keydown', onKeyDown);
-            document.body.style.overflow = '';
+            const index = modalStack.lastIndexOf(activeModalId);
+            if (index >= 0) modalStack.splice(index, 1);
+            document.body.style.overflow = modalStack.length > 0 ? 'hidden' : bodyOverflowBeforeModal;
+            if (returnFocusRef.current?.isConnected) returnFocusRef.current.focus();
         };
-    }, [open, onClose]);
+    }, [open]);
 
     if (!open) return null;
 
@@ -278,6 +323,10 @@ export function Modal({ open, onClose, title, subtitle, children, footer, header
             <div
                 role="dialog"
                 aria-modal="true"
+                aria-labelledby={titleId}
+                aria-describedby={subtitle ? subtitleId : undefined}
+                tabIndex={-1}
+                ref={dialogRef}
                 className={cn(
                     'bg-card w-full rounded-2xl shadow-2xl border border-border overflow-hidden max-h-[90vh] flex flex-col my-8',
                     widthClassName,
@@ -285,8 +334,8 @@ export function Modal({ open, onClose, title, subtitle, children, footer, header
             >
                 <div className={cn('p-6 flex justify-between items-start gap-4 bg-slate-900 text-white', headerClassName)}>
                     <div className="min-w-0">
-                        <div className="text-2xl font-bold truncate">{title}</div>
-                        {subtitle && <div className="text-xs text-slate-300 mt-1">{subtitle}</div>}
+                        <div id={titleId} className="text-2xl font-bold truncate">{title}</div>
+                        {subtitle && <div id={subtitleId} className="text-xs text-slate-300 mt-1">{subtitle}</div>}
                     </div>
                     <button
                         ref={closeButtonRef}

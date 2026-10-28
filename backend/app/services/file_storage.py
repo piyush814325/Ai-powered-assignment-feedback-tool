@@ -1,6 +1,6 @@
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Protocol
 
@@ -17,6 +17,23 @@ class FileStorage(Protocol):
     def delete(self, object_key: str) -> None: ...
 
     def signed_url(self, object_key: str, expires_in: int = 60) -> str: ...
+
+
+class FileCleanupError(RuntimeError):
+    pass
+
+
+def delete_storage_objects(storage: FileStorage, object_keys: Iterable[str]) -> None:
+    errors: list[Exception] = []
+    for object_key in dict.fromkeys(object_keys):
+        try:
+            storage.delete(object_key)
+        except Exception as error:
+            errors.append(error)
+    if errors:
+        raise FileCleanupError(
+            f"{len(errors)} stored file(s) could not be removed"
+        ) from errors[0]
 
 
 class SupabaseStorage:

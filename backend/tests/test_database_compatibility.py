@@ -18,8 +18,17 @@ from app.database import (
     normalize_database_url,
     sanitize_database_error,
 )
-from app.migration import run_migrations
-from app.models import Assignment, Evaluation, Submission, SubmissionStatus, User, UserRole
+from app.migration import _ensure_indexes, _ensure_model_columns, run_migrations
+from app.models import (
+    Assignment,
+    Evaluation,
+    Submission,
+    SubmissionStatus,
+    UploadBatch,
+    UploadBatchStatus,
+    User,
+    UserRole,
+)
 from app.routers.assignments import delete_assignment
 from app.routers.submissions import list_submissions
 from app.services.file_storage import SupabaseStorage
@@ -28,8 +37,9 @@ from main import health_check
 
 def _database_targets():
     targets = [("sqlite", "sqlite://")]
-    if os.getenv("TEST_POSTGRES_URL"):
-        targets.append(("postgresql", os.environ["TEST_POSTGRES_URL"]))
+    test_database_url = os.getenv("TEST_DATABASE_URL") or os.getenv("TEST_POSTGRES_URL")
+    if test_database_url:
+        targets.append(("postgresql", test_database_url))
     return targets
 
 
@@ -43,9 +53,6 @@ def compatibility_db(request):
             poolclass=StaticPool,
         )
     else:
-        parsed_url = make_url(url)
-        if not parsed_url.database or "test" not in parsed_url.database.casefold():
-            pytest.fail("TEST_POSTGRES_URL must point to a dedicated database containing 'test'")
         normalized = normalize_database_url(url)
         db_engine = create_engine(normalized, pool_pre_ping=True)
 
@@ -201,7 +208,7 @@ def test_case_insensitive_email_and_name_lookup(compatibility_db):
     db.rollback()
 
     assert by_email.id == student.id
-    assert [result.id for result in name_results] == [submission.id]
+    assert [result["id"] for result in name_results] == [submission.id]
 
 
 def test_assignment_delete_removes_assignment_without_submissions(compatibility_db):
@@ -216,16 +223,18 @@ def test_assignment_delete_removes_assignment_without_submissions(compatibility_
     assert db.get(Assignment, assignment.id) is None
 
 
-def test_assignment_with_submissions_cannot_be_deleted(compatibility_db):
+def test_assignment_delete_removes_assignment_and_submission(compatibility_db):
     db, _ = compatibility_db
     teacher, _, assignment, submission = _create_related_rows(db)
+    submission.file_path = None
+    submission_id = submission.id
+    db.commit()
 
-    with pytest.raises(HTTPException) as error:
-        delete_assignment(assignment.id, teacher, db)
+    response = delete_assignment(assignment.id, teacher, db)
 
-    assert error.value.status_code == 409
-    assert db.get(Assignment, assignment.id) is not None
-    assert db.get(Submission, submission.id) is not None
+    assert response.status_code == 204
+    assert db.get(Assignment, assignment.id) is None
+    assert db.get(Submission, submission_id) is None
 
 
 def test_mutable_json_values_persist(compatibility_db):
@@ -392,12 +401,130 @@ def test_database_startup_retries_and_logs_sanitized_failure(monkeypatch, caplog
     assert "Tenant or user not found" in caplog.text
 
 
-@pytest.mark.skipif(not os.getenv("TEST_POSTGRES_URL"), reason="requires a disposable PostgreSQL test database")
+def test_roster_schema_additions_are_idempotent_on_sqlite():
+    db_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    try:
+        Base.metadata.create_all(bind=db_engine)
+        with db_engine.begin() as connection:
+            connection.exec_driver_sql("DROP INDEX ix_users_roll_no")
+            connection.exec_driver_sql("ALTER TABLE users DROP COLUMN roll_no")
+            for column in (
+                "topic_text",
+                "topic_number",
+                "source",
+                "roster_row_ref",
+            ):
+                connection.exec_driver_sql(
+                    f"ALTER TABLE assignment_assignees DROP COLUMN {column}"
+                )
+        for _ in range(2):
+            _ensure_model_columns(db_engine)
+            _ensure_indexes(db_engine)
+        inspector = inspect(db_engine)
+        user_columns = {column["name"] for column in inspector.get_columns("users")}
+        assignee_columns = {
+            column["name"] for column in inspector.get_columns("assignment_assignees")
+        }
+        assert "roll_no" in user_columns
+        assert {
+            "topic_text",
+            "topic_number",
+            "source",
+            "roster_row_ref",
+        }.issubset(assignee_columns)
+        with db_engine.connect() as connection:
+            index_names = set(
+                connection.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='users'")
+                ).scalars()
+            )
+        assert "ix_users_roll_no" in index_names
+    finally:
+        db_engine.dispose()
+
+
+def test_upload_batch_name_addition_is_idempotent_and_preserves_legacy_rows():
+    db_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    try:
+        Base.metadata.create_all(bind=db_engine)
+        with Session(db_engine) as db:
+            teacher = User(
+                email=f"legacy-batch-{uuid4().hex}@example.test",
+                full_name="Legacy Batch Owner",
+                hashed_password="test-hash",
+                role=UserRole.TEACHER,
+            )
+            db.add(teacher)
+            db.flush()
+            batch = UploadBatch(
+                teacher_id=teacher.id,
+                name=None,
+                file_count=2,
+                status=UploadBatchStatus.COMPLETED,
+            )
+            db.add(batch)
+            db.commit()
+            batch_id = batch.id
+
+        with db_engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE upload_batches DROP COLUMN name")
+
+        _ensure_model_columns(db_engine)
+        inspector = inspect(db_engine)
+        columns_after_first_startup = {
+            column["name"] for column in inspector.get_columns("upload_batches")
+        }
+        with db_engine.connect() as connection:
+            row_after_first_startup = connection.execute(
+                text(
+                    "SELECT id, teacher_id, file_count, status, name "
+                    "FROM upload_batches WHERE id = :batch_id"
+                ),
+                {"batch_id": batch_id},
+            ).one()
+
+        _ensure_model_columns(db_engine)
+        inspector = inspect(db_engine)
+        columns_after_second_startup = {
+            column["name"] for column in inspector.get_columns("upload_batches")
+        }
+        with db_engine.connect() as connection:
+            row_after_second_startup = connection.execute(
+                text(
+                    "SELECT id, teacher_id, file_count, status, name "
+                    "FROM upload_batches WHERE id = :batch_id"
+                ),
+                {"batch_id": batch_id},
+            ).one()
+
+        assert "name" in columns_after_first_startup
+        assert columns_after_second_startup == columns_after_first_startup
+        assert row_after_first_startup == row_after_second_startup
+        assert row_after_second_startup.name is None
+        assert row_after_second_startup.file_count == 2
+        assert row_after_second_startup.status == UploadBatchStatus.COMPLETED.name
+    finally:
+        db_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not (os.getenv("TEST_DATABASE_URL") or os.getenv("TEST_POSTGRES_URL")),
+    reason="requires a disposable PostgreSQL test database",
+)
 def test_postgres_migrations_are_idempotent_and_rls_enabled():
-    url = make_url(os.environ["TEST_POSTGRES_URL"])
-    if not url.database or "test" not in url.database.casefold():
-        pytest.fail("TEST_POSTGRES_URL must point to a dedicated database containing 'test'")
-    db_engine = create_engine(normalize_database_url(os.environ["TEST_POSTGRES_URL"]))
+    test_database_url = os.getenv("TEST_DATABASE_URL") or os.environ["TEST_POSTGRES_URL"]
+    url = make_url(test_database_url)
+    if not url.database:
+        pytest.fail("TEST_DATABASE_URL must point to a dedicated disposable database")
+    db_engine = create_engine(normalize_database_url(test_database_url))
     try:
         Base.metadata.create_all(bind=db_engine)
         run_migrations(db_engine)
@@ -412,6 +539,29 @@ def test_postgres_migrations_are_idempotent_and_rls_enabled():
                 "SELECT tablename, policyname FROM pg_policies "
                 "WHERE schemaname = 'public'"
             )).all()
+        inspector = inspect(db_engine)
+        assert {
+            "roll_no"
+        }.issubset(
+            {column["name"] for column in inspector.get_columns("users")}
+        )
+        assert {
+            "topic_text",
+            "topic_number",
+            "source",
+            "roster_row_ref",
+        }.issubset(
+            {
+                column["name"]
+                for column in inspector.get_columns("assignment_assignees")
+            }
+        )
+        roll_index = next(
+            index
+            for index in inspector.get_indexes("users")
+            if "roll_no" in index["column_names"]
+        )
+        assert roll_index["unique"] is False
         assert set(Base.metadata.tables).issubset(rls_tables)
         assert not [policy for policy in policies if policy.tablename in Base.metadata.tables]
     finally:

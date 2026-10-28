@@ -89,29 +89,75 @@ def _convert_legacy_types(engine) -> None:
 
 
 def _ensure_indexes(engine) -> None:
+    inspector = inspect(engine)
     for table in Base.metadata.tables.values():
+        if not inspector.has_table(table.name):
+            continue
+        if engine.dialect.name == "sqlite":
+            with engine.connect() as connection:
+                existing_names = set(
+                    connection.execute(
+                        text(
+                            "SELECT name FROM sqlite_master "
+                            "WHERE type = 'index' AND tbl_name = :table_name"
+                        ),
+                        {"table_name": table.name},
+                    ).scalars()
+                )
+        else:
+            existing_names = {
+                index.get("name") for index in inspector.get_indexes(table.name)
+            }
         for index in table.indexes:
-            index.create(bind=engine, checkfirst=True)
+            if index.name in existing_names:
+                continue
+            index.create(
+                bind=engine,
+                checkfirst=engine.dialect.name != "sqlite",
+            )
+            if index.name:
+                existing_names.add(index.name)
 
 
 def _ensure_foreign_keys(engine) -> None:
     inspector = inspect(engine)
-    if not inspector.has_table("submissions") or not inspector.has_table("users"):
-        return
-    foreign_keys = inspector.get_foreign_keys("submissions")
-    has_override_reference = any(
-        foreign_key.get("constrained_columns") == ["teacher_override_by"]
-        and foreign_key.get("referred_table") == "users"
-        for foreign_key in foreign_keys
+    foreign_key_specs = (
+        ("submissions", "teacher_override_by", "users", "fk_submissions_teacher_override_by_users"),
+        ("submissions", "uploaded_by_teacher_id", "users", "fk_submissions_uploaded_by_teacher_users"),
+        ("submissions", "teacher_confirmed_by", "users", "fk_submissions_teacher_confirmed_by_users"),
+        ("submissions", "upload_batch_id", "upload_batches", "fk_submissions_upload_batch"),
+        ("assignment_assignees", "assignment_id", "assignments", "fk_assignment_assignees_assignment"),
+        ("assignment_assignees", "student_id", "users", "fk_assignment_assignees_student"),
+        ("upload_batches", "teacher_id", "users", "fk_upload_batches_teacher"),
+        ("upload_batches", "target_assignment_id", "assignments", "fk_upload_batches_target_assignment"),
+        ("upload_batch_files", "batch_id", "upload_batches", "fk_upload_batch_files_batch"),
+        ("upload_batch_files", "resolved_student_id", "users", "fk_upload_batch_files_student"),
+        ("upload_batch_files", "resolved_assignment_id", "assignments", "fk_upload_batch_files_assignment"),
+        ("upload_batch_files", "submission_id", "submissions", "fk_upload_batch_files_submission"),
     )
-    if not has_override_reference and "teacher_override_by" in {
-        column["name"] for column in inspector.get_columns("submissions")
-    }:
+    preparer = engine.dialect.identifier_preparer
+    for table_name, column_name, referred_table, constraint_name in foreign_key_specs:
+        if not inspector.has_table(table_name) or not inspector.has_table(referred_table):
+            continue
+        columns = {column["name"] for column in inspector.get_columns(table_name)}
+        if column_name not in columns:
+            continue
+        existing = inspector.get_foreign_keys(table_name)
+        has_reference = any(
+            foreign_key.get("constrained_columns") == [column_name]
+            and foreign_key.get("referred_table") == referred_table
+            for foreign_key in existing
+        )
+        if has_reference:
+            continue
+        table = preparer.quote(table_name)
+        column = preparer.quote(column_name)
+        target = preparer.quote(referred_table)
+        constraint = preparer.quote(constraint_name)
         with engine.begin() as connection:
             connection.exec_driver_sql(
-                "ALTER TABLE submissions ADD CONSTRAINT "
-                "fk_submissions_teacher_override_by_users "
-                "FOREIGN KEY (teacher_override_by) REFERENCES users (id)"
+                f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
+                f"FOREIGN KEY ({column}) REFERENCES {target} (id)"
             )
 
 

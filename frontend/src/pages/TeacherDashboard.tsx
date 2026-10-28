@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
-import { CheckCircle2, Code2, Edit3, GraduationCap, ListChecks, Plus, RefreshCw, Trash2, Zap, Sparkles } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CheckCircle2, Code2, Edit3, GraduationCap, ListChecks, Plus, RefreshCw, Trash2, Zap, Sparkles, UploadCloud } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
-import { assignmentsAPI, submissionsAPI } from '../services/api';
+import { assignmentAssigneesAPI, assignmentsAPI, getApiErrorMessage, submissionsAPI } from '../services/api';
 import { Button, Card, Input, Badge, Spinner, EmptyState, Alert, FormField, Modal, Textarea } from '../ui/components';
 import { StatCard } from '../components/dashboard/StatCard';
 import { EvaluationCriteria } from '../components/dashboard/EvaluationCriteria';
@@ -12,11 +12,25 @@ import ThemeToggle from '../components/ThemeToggle';
 import { formatDate, formatDateTime, submissionFileName, getSubmissionDisplayTitle } from '../lib/grading';
 import type { Submission } from '../types/submission';
 import type { Assignment, RubricCriterion } from '../types/assignment';
+import type { RosterImportSummary, TeacherStudent } from '../types/teacherUploads';
+import { UploadModal } from '../components/teacher-upload/UploadModal';
+import { RecentBatches } from '../components/teacher-upload/RecentBatches';
+import { AssigneeSelector } from '../components/teacher-upload/AssigneeSelector';
+import { AssigneeImportPanel } from '../components/teacher-upload/AssigneeImportPanel';
+import { AssigneeTopicList } from '../components/teacher-upload/AssigneeTopicList';
+import { RosterImportModal, type RosterImportSource } from '../components/teacher-upload/roster/RosterImportModal';
+import type { AssigneeList } from '../types/teacherUploads';
+import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal';
 
 type FilterTab = 'pending' | 'reviewed' | 'attention' | 'all';
 
 interface ApiError {
     response?: { data?: { detail?: string } };
+}
+
+interface RosterDialogState {
+    source: RosterImportSource;
+    afterImport?: (summary: RosterImportSummary) => void;
 }
 
 const verificationFailureLabels: Record<string, string> = {
@@ -54,26 +68,51 @@ export default function TeacherDashboard() {
     const [showAssignmentModal, setShowAssignmentModal] = useState(false);
     const [showManageAssignmentsModal, setShowManageAssignmentsModal] = useState(false);
     const [showOverrideModal, setShowOverrideModal] = useState(false);
+    const [showUploadModal, setShowUploadModal] = useState(false);
+    const [rosterDialog, setRosterDialog] = useState<RosterDialogState | null>(null);
+    const [activeBatchId, setActiveBatchId] = useState<number | null>(null);
+    const [recentUploadsVersion, setRecentUploadsVersion] = useState(0);
     const [overrideReason, setOverrideReason] = useState('');
     const [overrideError, setOverrideError] = useState('');
     const [verificationError, setVerificationError] = useState('');
     const [editingAssignment, setEditingAssignment] = useState<Assignment | null>(null);
     const [assignmentError, setAssignmentError] = useState('');
-    const [assignmentManageError, setAssignmentManageError] = useState('');
+    const [togglingAssignments, setTogglingAssignments] = useState<Record<number, boolean>>({});
+    const [assignmentToggleErrors, setAssignmentToggleErrors] = useState<Record<number, string>>({});
+    const assignmentsBeingToggled = useRef(new Set<number>());
+    const [assignmentToDelete, setAssignmentToDelete] = useState<Assignment | null>(null);
+    const [assignmentDeleteImpact, setAssignmentDeleteImpact] = useState<{
+        students_assigned: number;
+        submissions: number;
+        graded_submissions: number;
+    } | null>(null);
+    const [loadingAssignmentImpact, setLoadingAssignmentImpact] = useState(false);
+    const [deletingAssignment, setDeletingAssignment] = useState(false);
+    const [assignmentDeleteError, setAssignmentDeleteError] = useState('');
+    const [deleteAnnouncement, setDeleteAnnouncement] = useState('');
+    const [reviewNavigationError, setReviewNavigationError] = useState('');
+    const [restrictStudents, setRestrictStudents] = useState(false);
+    const [assignees, setAssignees] = useState<Pick<TeacherStudent, 'id' | 'full_name' | 'roll_no'>[]>([]);
+    const [assigneeDetails, setAssigneeDetails] = useState<AssigneeList['students']>([]);
+    const [savingAssignment, setSavingAssignment] = useState(false);
     const [assignmentForm, setAssignmentForm] = useState({
         subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code', 'image'], rubric: emptyRubric(), is_active: true,
     });
 
     useEffect(() => {
-        if (selectedSubmission?.evaluation) {
-            setEditedScores({ ...selectedSubmission.evaluation.scores });
-            setEditedFeedback({ ...selectedSubmission.evaluation.feedback });
-            setSaveSuccess(false);
-            setShowSourceCode(false);
+        const evaluation = selectedSubmission?.evaluation;
+        if (evaluation) {
+            const timer = window.setTimeout(() => {
+                setEditedScores({ ...evaluation.scores });
+                setEditedFeedback({ ...evaluation.feedback });
+                setSaveSuccess(false);
+                setShowSourceCode(false);
+            }, 0);
+            return () => window.clearTimeout(timer);
         }
     }, [selectedSubmission]);
 
-    const loadSubmissions = async () => {
+    const loadSubmissions = useCallback(async () => {
         try {
             setLoading(true);
             const response = await submissionsAPI.listSubmissions();
@@ -86,39 +125,78 @@ export default function TeacherDashboard() {
                 const updated = response.data.find((s: Submission) => s.id === current.id);
                 return updated ?? current;
             });
-        } catch (err) {
-            console.error('Failed to load submissions', err);
+        } catch {
+            console.error('Failed to load submissions');
         } finally {
             setLoading(false);
         }
-    };
+    }, []);
 
-    const loadAssignments = async () => {
+    const loadAssignments = useCallback(async () => {
         try {
             const response = await assignmentsAPI.list();
             setAssignments(response.data);
-        } catch (err) {
-            console.error('Failed to load assignments', err);
+        } catch {
+            console.error('Failed to load assignments');
+        }
+    }, []);
+
+    useEffect(() => {
+        const timer = window.setTimeout(() => {
+            void loadSubmissions();
+            void loadAssignments();
+        }, 0);
+        return () => window.clearTimeout(timer);
+    }, [loadAssignments, loadSubmissions]);
+
+    const openUploadModal = () => {
+        setActiveBatchId(null);
+        setShowUploadModal(true);
+    };
+
+    const openRecentBatch = (batchId: number) => {
+        setActiveBatchId(batchId);
+        setShowUploadModal(true);
+    };
+
+    const openSubmissionFromBatch = async (submissionId: number) => {
+        setReviewNavigationError('');
+        try {
+            const existing = submissions.find((submission) => submission.id === submissionId);
+            const submission = existing ?? (await submissionsAPI.getSubmission(submissionId)).data;
+            setSelectedSubmission(submission);
+            setFilterTab('all');
+            setShowUploadModal(false);
+        } catch (requestError) {
+            setReviewNavigationError(getApiErrorMessage(requestError));
         }
     };
 
-    useEffect(() => {
-        loadSubmissions();
-        loadAssignments();
-    }, []);
-
-    const openAssignmentModal = (assignment?: Assignment) => {
+    const openAssignmentModal = async (assignment?: Assignment) => {
         setEditingAssignment(assignment ?? null);
         setAssignmentError('');
+        setAssignees([]);
+        setAssigneeDetails([]);
+        setRestrictStudents(false);
         setAssignmentForm(assignment ? {
             subject_name: assignment.subject_name, subject_code: assignment.subject_code, title: assignment.title,
             description: assignment.description ?? '', due_date: assignment.due_date ? assignment.due_date.slice(0, 16) : '',
             max_score: String(assignment.max_score), allowed_file_types: assignment.allowed_file_types, rubric: assignment.rubric, is_active: assignment.is_active,
         } : { subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code', 'image'], rubric: emptyRubric(), is_active: true });
+        if (assignment) {
+            try {
+                const response = await assignmentAssigneesAPI.get(assignment.id);
+                setAssignees(response.data.students);
+                setAssigneeDetails(response.data.students);
+                setRestrictStudents(response.data.students.length > 0);
+            } catch (requestError) {
+                setAssignmentError(getApiErrorMessage(requestError));
+            }
+        }
         setShowAssignmentModal(true);
     };
 
-    const saveAssignment = async (event: React.FormEvent) => {
+    const saveAssignment = async (event: React.FormEvent | React.MouseEvent, openRosterAfterSave = false) => {
         event.preventDefault();
         const rubricTotal = assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0);
         if (!assignmentForm.subject_name.trim() || !assignmentForm.subject_code.trim() || !assignmentForm.title.trim() || !assignmentForm.due_date || assignmentForm.allowed_file_types.length === 0) {
@@ -130,32 +208,90 @@ export default function TeacherDashboard() {
             return;
         }
         try {
+            setSavingAssignment(true);
             const payload = { ...assignmentForm, max_score: Number(assignmentForm.max_score), due_date: new Date(assignmentForm.due_date).toISOString() };
-            if (editingAssignment) await assignmentsAPI.update(editingAssignment.id, payload);
-            else await assignmentsAPI.create(payload);
+            const response = editingAssignment
+                ? await assignmentsAPI.update(editingAssignment.id, payload)
+                : await assignmentsAPI.create(payload);
+            const assignmentId = editingAssignment?.id ?? response.data.id;
+            await assignmentAssigneesAPI.replace(assignmentId, {
+                student_ids: restrictStudents ? assignees.map((student) => student.id) : [],
+            });
             setShowAssignmentModal(false);
             await loadAssignments();
-        } catch (err) {
-            const apiError = err as ApiError;
-            setAssignmentError(apiError.response?.data?.detail || 'Could not save assignment');
+            if (openRosterAfterSave) setRosterDialog({ source: { assignmentId } });
+        } catch (requestError) {
+            setAssignmentError(getApiErrorMessage(requestError));
+        } finally {
+            setSavingAssignment(false);
         }
     };
 
-    const toggleAssignment = async (assignment: Assignment) => {
-        await assignmentsAPI.update(assignment.id, { is_active: !assignment.is_active });
-        await loadAssignments();
+    const toggleAssignment = async (assignment: Assignment, isActive: boolean) => {
+        if (assignmentsBeingToggled.current.has(assignment.id)) return;
+        assignmentsBeingToggled.current.add(assignment.id);
+        setTogglingAssignments((current) => ({ ...current, [assignment.id]: true }));
+        setAssignmentToggleErrors((current) => {
+            const next = { ...current };
+            delete next[assignment.id];
+            return next;
+        });
+        try {
+            const response = await assignmentsAPI.update(assignment.id, {
+                is_active: isActive,
+            });
+            setAssignments((current) => current.map((item) =>
+                item.id === assignment.id ? response.data : item,
+            ));
+        } catch (requestError) {
+            setAssignmentToggleErrors((current) => ({
+                ...current,
+                [assignment.id]: getApiErrorMessage(requestError),
+            }));
+        } finally {
+            assignmentsBeingToggled.current.delete(assignment.id);
+            setTogglingAssignments((current) => ({
+                ...current,
+                [assignment.id]: false,
+            }));
+        }
     };
 
-    const deactivateAssignment = async (assignment: Assignment) => {
-        setAssignmentManageError('');
+    const openAssignmentDelete = async (assignment: Assignment) => {
+        setAssignmentToDelete(assignment);
+        setAssignmentDeleteImpact(null);
+        setAssignmentDeleteError('');
+        setLoadingAssignmentImpact(true);
         try {
-            await assignmentsAPI.remove(assignment.id);
-            await loadAssignments();
-        } catch (err) {
-            const apiError = err as ApiError;
-            setAssignmentManageError(
-                apiError.response?.data?.detail || 'Could not delete assignment',
-            );
+            const response = await assignmentsAPI.deleteImpact(assignment.id);
+            setAssignmentDeleteImpact(response.data);
+        } catch (requestError) {
+            setAssignmentDeleteError(getApiErrorMessage(requestError));
+        } finally {
+            setLoadingAssignmentImpact(false);
+        }
+    };
+
+    const deleteAssignment = async () => {
+        if (!assignmentToDelete || deletingAssignment) return;
+        setDeletingAssignment(true);
+        setAssignmentDeleteError('');
+        try {
+            const deletedId = assignmentToDelete.id;
+            await assignmentsAPI.remove(deletedId);
+            setAssignments((current) => current.filter((assignment) => assignment.id !== deletedId));
+            setSubmissions((current) => current.filter((submission) => submission.assignment_id !== deletedId));
+            setSelectedSubmission((current) => current?.assignment_id === deletedId ? null : current);
+            setShowAssignmentModal(false);
+            setEditingAssignment(null);
+            setAssignmentToDelete(null);
+            setRecentUploadsVersion((version) => version + 1);
+            setDeleteAnnouncement('Assignment and its related submissions were deleted.');
+            await Promise.all([loadAssignments(), loadSubmissions()]);
+        } catch (requestError) {
+            setAssignmentDeleteError(getApiErrorMessage(requestError));
+        } finally {
+            setDeletingAssignment(false);
         }
     };
 
@@ -182,8 +318,8 @@ export default function TeacherDashboard() {
                 setSaveSuccess(false);
                 loadSubmissions();
             }, 1200);
-        } catch (err) {
-            console.error('Failed to update evaluation', err);
+        } catch {
+            console.error('Failed to update evaluation');
         } finally {
             setIsSaving(false);
         }
@@ -195,8 +331,8 @@ export default function TeacherDashboard() {
             setIsSaving(true);
             await submissionsAPI.evaluate(selectedSubmission.id, undefined, false);
             await loadSubmissions();
-        } catch (err) {
-            console.error('Failed to re-evaluate', err);
+        } catch {
+            console.error('Failed to re-evaluate');
         } finally {
             setIsSaving(false);
         }
@@ -309,13 +445,20 @@ export default function TeacherDashboard() {
                             <div className="flex justify-between items-center">
                                 <h2 className="text-xl font-bold text-foreground">Submission queue</h2>
                                 <div className="flex flex-wrap gap-2">
-                                    <Button size="sm" onClick={() => openAssignmentModal()}><Plus className="h-4 w-4" />Create assignment</Button>
+                                    <Button size="sm" onClick={openUploadModal}><UploadCloud className="h-4 w-4" />Upload student files</Button>
+                                    <Button size="sm" onClick={() => void openAssignmentModal()}><Plus className="h-4 w-4" />Create assignment</Button>
                                     <Button variant="outline" size="sm" onClick={() => setShowManageAssignmentsModal(true)}>
                                         Assignments ({assignments.length})
                                     </Button>
                                     <Button variant="outline" size="sm" onClick={loadSubmissions}><RefreshCw className="h-4 w-4" />Reload</Button>
                                 </div>
                             </div>
+
+                            {reviewNavigationError && <Alert variant="error">{reviewNavigationError}</Alert>}
+                            <RecentBatches
+                                refreshVersion={recentUploadsVersion}
+                                onOpen={openRecentBatch}
+                            />
 
                             <Input
                                 type="text"
@@ -380,15 +523,19 @@ export default function TeacherDashboard() {
                                         >
                                             <div className="flex justify-between items-start gap-2">
                                                 <div className="min-w-0">
-                                                    <div className="flex items-center gap-2">
+                                                    <div className="flex flex-wrap items-center gap-2">
                                                         <h3 className="font-bold text-foreground text-sm truncate">{getSubmissionDisplayTitle(sub)}</h3>
-                                                        <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-muted text-muted-foreground shrink-0">
-                                                            {sub.file_type}
-                                                        </span>
+                                                        {sub.file_type && (
+                                                            <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-muted text-muted-foreground shrink-0">
+                                                                {sub.file_type}
+                                                            </span>
+                                                        )}
+                                                        {sub.source === 'teacher_upload' && <Badge variant="info">Uploaded by teacher</Badge>}
                                                     </div>
                                                     <p className="text-xs text-muted-foreground mt-1">
-                                                        Student #{sub.student_id}
+                                                        {sub.student_name || `Student #${sub.student_id}`}
                                                     </p>
+                                                    {sub.student_topic && <p className="text-xs text-muted-foreground">Topic: {sub.student_topic}</p>}
                                                     <p className="text-[11px] text-muted-foreground">{formatDate(sub.created_at)}</p>
                                                     {sub.status === 'needs_attention' && <Badge variant="danger" className="mt-2">Needs attention</Badge>}
                                                 </div>
@@ -399,7 +546,7 @@ export default function TeacherDashboard() {
                                                             {sub.evaluation.total_score?.toFixed(1)}
                                                         </span>
                                                         <p className="text-[10px] text-muted-foreground">
-                                                            {(sub.evaluation.ai_confidence * 100).toFixed(0)}% AI conf.
+                                                            {((sub.evaluation.ai_confidence ?? 0) * 100).toFixed(0)}% AI conf.
                                                         </p>
                                                         <Badge
                                                             variant={sub.evaluation.is_reviewed ? 'success' : 'warning'}
@@ -423,16 +570,20 @@ export default function TeacherDashboard() {
                             <Card className="p-6 space-y-6 shadow-md">
                                 <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-4 pb-4 border-b border-border">
                                     <div className="min-w-0">
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex flex-wrap items-center gap-2">
                                             <h2 className="text-2xl font-extrabold text-foreground truncate">
                                                 {getSubmissionDisplayTitle(selectedSubmission)}
                                             </h2>
                                             <Badge className="bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300 shrink-0">
-                                                Student #{selectedSubmission.student_id}
+                                                {selectedSubmission.student_name || `Student #${selectedSubmission.student_id}`}
                                             </Badge>
+                                            {selectedSubmission.source === 'teacher_upload' && <Badge variant="info">Uploaded by teacher</Badge>}
                                         </div>
+                                        {selectedSubmission.student_topic && (
+                                            <p className="mt-2 text-sm text-muted-foreground">Student topic: {selectedSubmission.student_topic}</p>
+                                        )}
                                         <p className="text-xs text-muted-foreground mt-1 truncate">
-                                            {submissionFileName(selectedSubmission)} · Submitted {formatDateTime(selectedSubmission.created_at)}
+                                            {submissionFileName(selectedSubmission) || 'Filename unavailable'} · Submitted {formatDateTime(selectedSubmission.created_at)}
                                         </p>
                                     </div>
 
@@ -551,7 +702,7 @@ export default function TeacherDashboard() {
                                             <div className="text-right">
                                                 <p className="text-xs font-semibold text-muted-foreground uppercase">AI confidence</p>
                                                 <p className="text-xl font-bold text-emerald-600 dark:text-emerald-400 mt-0.5">
-                                                    {(selectedSubmission.evaluation.ai_confidence * 100).toFixed(0)}%
+                                                    {((selectedSubmission.evaluation.ai_confidence ?? 0) * 100).toFixed(0)}%
                                                 </p>
                                             </div>
                                         </div>
@@ -597,6 +748,11 @@ export default function TeacherDashboard() {
                                         </div>
 
                                         <div className="pt-4 border-t border-border flex justify-end">
+                                            {selectedSubmission.source === 'teacher_upload' && (
+                                                <p className="mr-auto self-center text-xs text-muted-foreground">
+                                                    The student will see this result only after you approve it.
+                                                </p>
+                                            )}
                                             <Button onClick={handleSaveAndApprove} isLoading={isSaving} size="lg" className="w-full sm:w-auto">
                                                 <CheckCircle2 className="h-4 w-4" />
                                                 {isSaving ? 'Saving…' : 'Approve & release to student'}
@@ -646,8 +802,21 @@ export default function TeacherDashboard() {
             </Modal>
 
             <Modal open={showAssignmentModal} onClose={() => setShowAssignmentModal(false)} title={editingAssignment ? 'Edit assignment' : 'Create assignment'} widthClassName="max-w-2xl">
-                <form onSubmit={saveAssignment} className="p-6 space-y-4">
+                <form onSubmit={(event) => void saveAssignment(event)} className="p-6 space-y-4">
                     {assignmentError && <Alert variant="error">{assignmentError}</Alert>}
+                    {editingAssignment && (
+                        <div className="flex justify-end">
+                            <Button
+                                type="button"
+                                variant="destructive"
+                                onClick={() => void openAssignmentDelete(editingAssignment)}
+                                disabled={savingAssignment}
+                            >
+                                <Trash2 className="h-4 w-4" />
+                                Delete assignment
+                            </Button>
+                        </div>
+                    )}
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <FormField label="Subject name" htmlFor="subject-name"><Input id="subject-name" value={assignmentForm.subject_name} onChange={(e) => setAssignmentForm({ ...assignmentForm, subject_name: e.target.value })} /></FormField>
                         <FormField label="Subject code" htmlFor="subject-code"><Input id="subject-code" value={assignmentForm.subject_code} onChange={(e) => setAssignmentForm({ ...assignmentForm, subject_code: e.target.value })} /></FormField>
@@ -658,6 +827,38 @@ export default function TeacherDashboard() {
                         <FormField label="Due date" htmlFor="assignment-due"><Input id="assignment-due" type="datetime-local" value={assignmentForm.due_date} onChange={(e) => setAssignmentForm({ ...assignmentForm, due_date: e.target.value })} /></FormField>
                         <FormField label="Max score" htmlFor="assignment-score"><Input id="assignment-score" type="number" min="1" value={assignmentForm.max_score} onChange={(e) => setAssignmentForm({ ...assignmentForm, max_score: e.target.value })} /></FormField>
                     </div>
+                    <AssigneeSelector
+                        enabled={restrictStudents}
+                        students={assignees}
+                        disabled={savingAssignment}
+                        onEnabledChange={setRestrictStudents}
+                        onStudentsChange={setAssignees}
+                    />
+                    {editingAssignment && (
+                        <AssigneeImportPanel
+                            assignmentId={editingAssignment.id}
+                            onApplied={(students) => {
+                                setAssignees(students);
+                                setAssigneeDetails((current) => {
+                                    const byId = new Map(current.map((student) => [student.id, student]));
+                                    return students.map((student) => byId.get(student.id) ?? {
+                                        ...student,
+                                        roll_no: null,
+                                        topic_text: null,
+                                        topic_number: null,
+                                        source: null,
+                                    });
+                                });
+                                setRestrictStudents(students.length > 0);
+                            }}
+                        />
+                    )}
+                    {editingAssignment && (
+                        <AssigneeTopicList
+                            assignmentId={editingAssignment.id}
+                            students={assigneeDetails}
+                        />
+                    )}
                     <fieldset className="space-y-3">
                         <div className="flex items-center justify-between gap-3">
                             <legend className="block text-sm font-medium text-foreground">Rubric criteria</legend>
@@ -675,7 +876,11 @@ export default function TeacherDashboard() {
                         <Button type="button" variant="outline" size="sm" onClick={() => setAssignmentForm((prev) => ({ ...prev, rubric: [...prev.rubric, { key: '', label: '', description: '', max_points: 0 }] }))}><Plus className="h-4 w-4" />Add criterion</Button>
                     </fieldset>
                     <fieldset><legend className="block text-sm font-medium text-foreground mb-1.5">Allowed file types</legend><div className="flex flex-wrap gap-4">{['pdf', 'docx', 'txt', 'code', 'image'].map((type) => <label key={type} className="flex items-center gap-2 text-sm text-foreground"><input type="checkbox" checked={assignmentForm.allowed_file_types.includes(type)} onChange={(e) => setAssignmentForm({ ...assignmentForm, allowed_file_types: e.target.checked ? [...assignmentForm.allowed_file_types, type] : assignmentForm.allowed_file_types.filter((item) => item !== type) })} />{type.toUpperCase()}</label>)}</div></fieldset>
-                    <div className="flex justify-end gap-2 pt-2"><Button type="button" variant="outline" onClick={() => setShowAssignmentModal(false)}>Cancel</Button><Button type="submit" disabled={assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0) !== Number(assignmentForm.max_score) || assignmentForm.rubric.some((criterion) => !criterion.label.trim())}>{editingAssignment ? 'Save changes' : 'Create assignment'}</Button></div>
+                    <div className="flex flex-wrap justify-end gap-2 pt-2">
+                        <Button type="button" variant="outline" onClick={(event) => void saveAssignment(event, true)} disabled={savingAssignment}>Import student roster</Button>
+                        <Button type="button" variant="outline" onClick={() => setShowAssignmentModal(false)} disabled={savingAssignment}>Cancel</Button>
+                        <Button type="submit" isLoading={savingAssignment} disabled={assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0) !== Number(assignmentForm.max_score) || assignmentForm.rubric.some((criterion) => !criterion.label.trim())}>{editingAssignment ? 'Save changes' : 'Create assignment'}</Button>
+                    </div>
                 </form>
             </Modal>
 
@@ -687,13 +892,12 @@ export default function TeacherDashboard() {
                 widthClassName="max-w-3xl"
             >
                 <div className="p-6 space-y-4">
-                    {assignmentManageError && <Alert variant="error">{assignmentManageError}</Alert>}
                     {assignments.length === 0 ? (
                         <EmptyState
                             title="No assignments created yet"
                             description="Click 'Create assignment' to set up your first rubric and assignment."
                             action={
-                                <Button size="sm" onClick={() => { setShowManageAssignmentsModal(false); openAssignmentModal(); }}>
+                                <Button size="sm" onClick={() => { setShowManageAssignmentsModal(false); void openAssignmentModal(); }}>
                                     <Plus className="h-4 w-4" /> Create assignment
                                 </Button>
                             }
@@ -703,7 +907,7 @@ export default function TeacherDashboard() {
                             {assignments.map((assignment) => (
                                 <div
                                     key={assignment.id}
-                                    className="p-4 rounded-xl border border-border bg-card/60 flex flex-col sm:flex-row justify-between sm:items-center gap-3"
+                                    className="p-4 rounded-xl border border-border bg-card/60 flex flex-col sm:flex-row flex-wrap justify-between sm:items-center gap-3"
                                 >
                                     <div className="min-w-0">
                                         <div className="flex items-center gap-2">
@@ -719,11 +923,13 @@ export default function TeacherDashboard() {
                                             <p className="text-[11px] text-muted-foreground">Due: {formatDate(assignment.due_date)}</p>
                                         )}
                                     </div>
-                                    <div className="flex items-center gap-2 shrink-0">
+                                    <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
                                         <Button
                                             size="sm"
                                             variant="outline"
-                                            onClick={() => toggleAssignment(assignment)}
+                                            onClick={() => void toggleAssignment(assignment, !assignment.is_active)}
+                                            disabled={Boolean(togglingAssignments[assignment.id])}
+                                            isLoading={Boolean(togglingAssignments[assignment.id])}
                                             title={assignment.is_active ? 'Deactivate' : 'Activate'}
                                         >
                                             {assignment.is_active ? 'Deactivate' : 'Activate'}
@@ -733,7 +939,7 @@ export default function TeacherDashboard() {
                                             variant="outline"
                                             onClick={() => {
                                                 setShowManageAssignmentsModal(false);
-                                                openAssignmentModal(assignment);
+                                                void openAssignmentModal(assignment);
                                             }}
                                             title="Edit assignment"
                                         >
@@ -743,18 +949,93 @@ export default function TeacherDashboard() {
                                         <Button
                                             size="sm"
                                             variant="destructive"
-                                            onClick={() => deactivateAssignment(assignment)}
-                                            title="Permanently delete assignment (only when it has no submissions)"
+                                            onClick={() => void openAssignmentDelete(assignment)}
+                                            title="Delete assignment and its related data"
                                         >
                                             <Trash2 className="h-3.5 w-3.5" />
+                                            Delete assignment
                                         </Button>
                                     </div>
+                                    {assignmentToggleErrors[assignment.id] && (
+                                        <div className="basis-full" role="status" aria-live="polite">
+                                            <Alert variant="error">{assignmentToggleErrors[assignment.id]}</Alert>
+                                        </div>
+                                    )}
                                 </div>
                             ))}
                         </div>
                     )}
                 </div>
             </Modal>
+
+            {showUploadModal && <UploadModal
+                open={showUploadModal}
+                initialBatchId={activeBatchId}
+                assignments={assignments}
+                onClose={() => setShowUploadModal(false)}
+                onBatchCreated={() => setRecentUploadsVersion((version) => version + 1)}
+                onBatchRenamed={() => setRecentUploadsVersion((version) => version + 1)}
+                onBatchDeleted={() => {
+                    setShowUploadModal(false);
+                    setActiveBatchId(null);
+                    setRecentUploadsVersion((version) => version + 1);
+                }}
+                onOpenSubmission={(submissionId) => void openSubmissionFromBatch(submissionId)}
+                onOpenRoster={(batchId, fileId, afterImport) => setRosterDialog({
+                    source: { batchId, fileId },
+                    afterImport,
+                })}
+            />}
+            {rosterDialog && (
+                <RosterImportModal
+                    open
+                    assignments={assignments}
+                    source={rosterDialog.source}
+                    onClose={() => setRosterDialog(null)}
+                    onImported={(summary) => {
+                        rosterDialog.afterImport?.(summary);
+                        setRecentUploadsVersion((version) => version + 1);
+                        if (editingAssignment) {
+                            void assignmentAssigneesAPI.get(editingAssignment.id)
+                                .then((response) => {
+                                    setAssignees(response.data.students);
+                                    setAssigneeDetails(response.data.students);
+                                })
+                                .catch((requestError: unknown) => setAssignmentError(getApiErrorMessage(requestError)));
+                        }
+                    }}
+                />
+            )}
+            <p className="sr-only" aria-live="polite" aria-atomic="true">{deleteAnnouncement}</p>
+            <ConfirmDeleteModal
+                key={`${assignmentToDelete?.id ?? 'closed'}-${assignmentToDelete !== null}`}
+                open={assignmentToDelete !== null}
+                onClose={() => {
+                    if (!deletingAssignment) setAssignmentToDelete(null);
+                }}
+                onConfirm={() => void deleteAssignment()}
+                title="Delete assignment?"
+                description={assignmentDeleteImpact
+                    ? `This deletes the assignment, ${assignmentDeleteImpact.students_assigned} assigned student${assignmentDeleteImpact.students_assigned === 1 ? '' : 's'}, ${assignmentDeleteImpact.submissions} submission${assignmentDeleteImpact.submissions === 1 ? '' : 's'} and ${assignmentDeleteImpact.graded_submissions} grade${assignmentDeleteImpact.graded_submissions === 1 ? '' : 's'}. This cannot be undone.`
+                    : 'Loading the number of assigned students, submissions, and grades that will be removed.'}
+                confirmLabel="Delete assignment"
+                busy={deletingAssignment}
+                loadingDetails={loadingAssignmentImpact}
+                disableConfirm={!assignmentDeleteImpact}
+                error={assignmentDeleteError || undefined}
+                confirmationValues={assignmentToDelete
+                    ? [assignmentToDelete.title, 'DELETE']
+                    : undefined}
+                confirmationLabel={assignmentToDelete
+                    ? `Type "${assignmentToDelete.title}" or DELETE to confirm`
+                    : undefined}
+            >
+                {assignmentDeleteImpact && (
+                    <p className="text-sm text-muted-foreground">
+                        Uploaded files, grading results, and feedback for these submissions will also be removed. Upload batches not tied to deleted submissions will remain.
+                    </p>
+                )}
+            </ConfirmDeleteModal>
         </div>
     );
 }

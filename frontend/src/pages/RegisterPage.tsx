@@ -21,6 +21,7 @@ function validateEmail(value: string) {
 export default function RegisterPage() {
     const [email, setEmail] = useState('');
     const [fullName, setFullName] = useState('');
+    const [rollNo, setRollNo] = useState('');
     const [password, setPassword] = useState('');
     const [confirmPassword, setConfirmPassword] = useState('');
     const [showPassword, setShowPassword] = useState(false);
@@ -45,7 +46,7 @@ export default function RegisterPage() {
         e.preventDefault();
         if (!validate()) return;
         try {
-            await register(email, fullName, password, role);
+            await register(email, fullName, password, role, role === 'student' && rollNo.trim() ? rollNo : undefined);
             navigate('/login');
         } catch {
             // Surfaced via `error` from the auth store.
@@ -86,6 +87,18 @@ export default function RegisterPage() {
                         required
                     />
                 </FormField>
+
+                {role === 'student' && (
+                    <FormField label="Roll number" htmlFor="register-roll-no">
+                        <Input
+                            id="register-roll-no"
+                            value={rollNo}
+                            onChange={(event) => setRollNo(event.target.value)}
+                            autoComplete="off"
+                        />
+                        <p className="mt-1 text-xs text-muted-foreground">Optional. Helps your teacher match you to class lists.</p>
+                    </FormField>
+                )}
 
                 <FormField label="Password" htmlFor="register-password" error={errors.password}>
                     <div className="relative">
