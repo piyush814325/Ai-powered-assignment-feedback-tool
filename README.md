@@ -10,7 +10,7 @@ Supabase Auth is not used.
 - Backend: FastAPI, SQLAlchemy 2.x, PostgreSQL
 - Database and private file storage: Supabase
 - LLM: Groq, with a local mock fallback
-- Parsing: PyMuPDF, python-docx, Pillow, Tesseract OCR
+- Parsing: PyMuPDF and python-docx
 
 ## Submission verification
 
@@ -86,16 +86,13 @@ Deploy from the repository root using [render.yaml](./render.yaml). Set:
 - `CORS_ORIGINS`: exact deployed frontend origin(s), comma-separated
 - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_BUCKET`
 
-The Docker image installs Tesseract and the English language pack, runs as a
-non-root user, and binds Uvicorn to Render's `$PORT`. Uploaded files are stored
+The Docker image runs as a non-root user and binds Uvicorn to Render's `$PORT`.
+Uploaded files are stored
 in the private Supabase Storage bucket, not on Render's ephemeral filesystem.
 `/health` checks PostgreSQL and returns 503 when the database is unavailable.
-The Render service must use the repository's **Docker** runtime so the image
-installs Tesseract and uses the pinned Python version. If an existing Render
-service was created with the native Python runtime, update it to the Blueprint's
-Docker service (or recreate it from `render.yaml`); setting `PYTHON_VERSION`
-alone does not install Tesseract. A `.env` file is only for local development;
-Render settings are read from the service's environment variables.
+The Render service must use the repository's **Docker** runtime and the pinned
+Python version. A `.env` file is only for local development; Render settings are
+read from the service's environment variables.
 
 Teacher spreadsheet uploads are processed by FastAPI background tasks and
 their per-file progress is persisted in PostgreSQL. A sleeping or restarted

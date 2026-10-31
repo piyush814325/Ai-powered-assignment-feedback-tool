@@ -4,6 +4,7 @@ import { useAuthStore } from '../store/authStore';
 import { assignmentsAPI, getApiErrorMessage, submissionsAPI } from '../services/api';
 import { Button, Card, Input, Select, Badge, Spinner, EmptyState, Modal, Alert } from '../ui/components';
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal';
+import { FileViewer } from '../components/FileViewer';
 import { StatCard } from '../components/dashboard/StatCard';
 import { EvaluationCriteria } from '../components/dashboard/EvaluationCriteria';
 import { ClassificationBadges } from '../components/dashboard/ClassificationBadges';
@@ -73,13 +74,7 @@ export default function StudentDashboard() {
     };
 
     const canDeleteSubmission = (submission: Submission) => {
-        if (
-            submission.status === 'processing'
-            || submission.evaluation?.total_score != null
-            || submission.evaluation?.is_reviewed
-            || submission.assignment?.is_active === false
-        ) return false;
-        return true;
+        return submission.source === 'student_upload' && !submission.evaluation?.is_reviewed;
     };
 
     const deleteSubmission = async () => {
@@ -96,6 +91,7 @@ export default function StudentDashboard() {
             await Promise.all([loadSubmissions(), loadAssignments()]);
         } catch (requestError) {
             setSubmissionDeleteError(getApiErrorMessage(requestError));
+            await loadSubmissions();
         } finally {
             setDeletingSubmission(false);
         }
@@ -122,6 +118,10 @@ export default function StudentDashboard() {
         : 0;
     const topScore = evaluatedSubmissions.length ? Math.max(...evaluatedSubmissions.map((s) => s.evaluation?.total_score ?? 0)) : 0;
     const reviewedCount = evaluatedSubmissions.filter((s) => s.evaluation?.is_reviewed).length;
+    const submittedAssignmentIds = useMemo(
+        () => new Set(submissions.map((submission) => submission.assignment_id)),
+        [submissions],
+    );
 
     return (
         <div className="min-h-screen bg-slate-50 dark:bg-slate-900 text-foreground">
@@ -183,7 +183,7 @@ export default function StudentDashboard() {
                             <div>
                                 <h2 className="text-lg font-bold text-foreground">Ready to submit an assignment?</h2>
                                 <p className="text-sm text-muted-foreground mt-1">
-                                    Upload a PDF, Word doc, code file, or image to get instant AI feedback.
+                                    Upload a PDF, Word doc, or code file to get instant AI feedback.
                                 </p>
                             </div>
                             <Button onClick={() => { setSubmissionToReplace(undefined); setShowUpload(true); }} size="lg" className="shrink-0">
@@ -201,7 +201,7 @@ export default function StudentDashboard() {
                                 <X className="h-4 w-4" />
                             </button>
                             <h2 className="text-lg font-bold mb-4 text-foreground">Submit assignment</h2>
-                            <UploadComponent assignments={assignments} onSuccess={handleUploadSuccess} submissionToReplace={submissionToReplace} />
+                            <UploadComponent assignments={assignments} submittedAssignmentIds={submittedAssignmentIds} onSuccess={handleUploadSuccess} submissionToReplace={submissionToReplace} />
                         </Card>
                     )}
                 </div>
@@ -286,6 +286,11 @@ export default function StudentDashboard() {
                                             <p className="text-xs text-muted-foreground">
                                                 Submitted {formatDateTime(submission.created_at)}
                                             </p>
+                                            {submission.status === 'failed' && submission.verification_reasons?.[0] && (
+                                                <p className="text-xs text-rose-700 dark:text-rose-300">
+                                                    {submission.verification_reasons[0]}
+                                                </p>
+                                            )}
                                             {submission.student_topic && (
                                                 <p className="text-xs text-muted-foreground">
                                                     <span className="font-semibold text-foreground">Your topic:</span> {submission.student_topic}
@@ -337,10 +342,11 @@ export default function StudentDashboard() {
                                                     Replace file
                                                 </Button>
                                             )}
-                                            {canDeleteSubmission(submission) && (
+                                            {canDeleteSubmission(submission) ? (
                                                 <Button
                                                     variant="destructive"
                                                     size="sm"
+                                                    disabled={submission.status === 'processing'}
                                                     onClick={(event) => {
                                                         event.stopPropagation();
                                                         setSubmissionDeleteError('');
@@ -350,7 +356,11 @@ export default function StudentDashboard() {
                                                     <Trash2 className="h-4 w-4" />
                                                     Delete submission
                                                 </Button>
-                                            )}
+                                            ) : (submission.source === 'teacher_upload' || submission.evaluation?.is_reviewed) ? (
+                                                <span className="text-xs text-muted-foreground">
+                                                    Locked: reviewed by your teacher
+                                                </span>
+                                            ) : null}
                                         </div>
                                     </div>
                                 </Card>
@@ -402,7 +412,7 @@ export default function StudentDashboard() {
                                     }`}
                             >
                                 <FileText className="h-4 w-4" />
-                                Extracted content
+                                Files
                             </button>
                         </div>
                         )}
@@ -513,16 +523,7 @@ export default function StudentDashboard() {
                                     />
                                 )
                             ) : (
-                                <div className="space-y-3">
-                                    <h3 className="text-lg font-bold text-foreground">Extracted document / code content</h3>
-                                    {selectedSubmission.extracted_text || selectedSubmission.extracted_code ? (
-                                        <pre className="p-4 bg-slate-950 text-slate-100 rounded-xl overflow-x-auto text-xs font-mono whitespace-pre-wrap max-h-96 leading-relaxed">
-                                            {selectedSubmission.extracted_code || selectedSubmission.extracted_text}
-                                        </pre>
-                                    ) : (
-                                        <p className="text-sm text-muted-foreground italic">Not available</p>
-                                    )}
-                                </div>
+                                <FileViewer key={selectedSubmission.id} submission={selectedSubmission} />
                             )}
                                 </>
                             )}
@@ -539,7 +540,9 @@ export default function StudentDashboard() {
                 }}
                 onConfirm={() => void deleteSubmission()}
                 title="Delete submission?"
-                description="This removes your submitted work. You can submit again before the deadline."
+                description={submissionToDelete && !submissionToDelete.can_resubmit
+                    ? "The deadline has passed. If you delete this submission you will not be able to submit again."
+                    : "This removes the file and its AI feedback. You can submit again before the assignment deadline."}
                 confirmLabel="Delete submission"
                 busy={deletingSubmission}
                 error={submissionDeleteError || undefined}

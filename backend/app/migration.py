@@ -1,8 +1,12 @@
+import logging
+
 from sqlalchemy import Column, inspect, text
 from sqlalchemy.schema import CreateColumn
 
 from app.database import Base
-import app.models
+from app.models import SUBMISSION_STUDENT_ASSIGNMENT_INDEX
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_model_columns(engine) -> None:
@@ -108,8 +112,35 @@ def _ensure_indexes(engine) -> None:
             existing_names = {
                 index.get("name") for index in inspector.get_indexes(table.name)
             }
+        skip_submission_unique_index = False
+        if (
+            table.name == "submissions"
+            and SUBMISSION_STUDENT_ASSIGNMENT_INDEX not in existing_names
+        ):
+            with engine.connect() as connection:
+                duplicate_groups, duplicate_rows = connection.execute(
+                    text(
+                        "SELECT COUNT(*), COALESCE(SUM(grouped.row_count), 0) "
+                        "FROM (SELECT COUNT(*) AS row_count FROM submissions "
+                        "WHERE student_id IS NOT NULL GROUP BY student_id, assignment_id "
+                        "HAVING COUNT(*) > 1) AS grouped"
+                    )
+                ).one()
+            if duplicate_groups:
+                skip_submission_unique_index = True
+                logger.warning(
+                    "Skipped unique submission index because duplicates exist: "
+                    "duplicate_groups=%s duplicate_rows=%s",
+                    duplicate_groups,
+                    duplicate_rows,
+                )
         for index in table.indexes:
             if index.name in existing_names:
+                continue
+            if (
+                skip_submission_unique_index
+                and index.name == SUBMISSION_STUDENT_ASSIGNMENT_INDEX
+            ):
                 continue
             index.create(
                 bind=engine,

@@ -132,6 +132,8 @@ export interface UploadBatchFile {
     resolved_student_name: string | null;
     resolved_assignment_id: number | null;
     resolved_assignment_name: string | null;
+    existing_submission_id: number | null;
+    existing_submission_reviewed: boolean | null;
     grading_status: string | null;
     error: string | null;
     warning: string | null;
@@ -166,6 +168,7 @@ export interface UploadBatchSummary {
     file_count: number;
     created_at: string;
     counts: Partial<Record<UploadBatchFileStatus, number>>;
+    student_names: string[];
 }
 
 export interface UploadBatchPage {

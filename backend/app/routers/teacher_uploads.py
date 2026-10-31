@@ -22,6 +22,7 @@ from fastapi import (
 )
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import (
@@ -36,6 +37,7 @@ from app.database import SessionLocal, get_db
 from app.models import (
     Assignment,
     AssignmentAssignee,
+    Evaluation,
     StudentMatchStatus,
     Submission,
     SubmissionSource,
@@ -48,7 +50,11 @@ from app.models import (
     UserRole,
 )
 from app.routers.auth import get_current_user, require_teacher
-from app.routers.submissions import _evaluate_submission
+from app.routers.submissions import (
+    _delete_submission_file_best_effort,
+    _delete_submission_rows,
+    _evaluate_submission,
+)
 from app.schemas.teacher_uploads import (
     ConfirmUploadRequest,
     RejectUploadRequest,
@@ -226,6 +232,24 @@ def _batch_file_response(db: Session, item: UploadBatchFile) -> UploadBatchFileR
         if item.submission_id
         else None
     )
+    existing_submission = None
+    existing_submission_reviewed = None
+    if (
+        item.status == UploadBatchFileStatus.DUPLICATE
+        and item.resolved_student_id is not None
+        and item.resolved_assignment_id is not None
+    ):
+        existing_submission = db.query(Submission).filter(
+            Submission.student_id == item.resolved_student_id,
+            Submission.assignment_id == item.resolved_assignment_id,
+        ).order_by(Submission.created_at.desc(), Submission.id.desc()).first()
+        if existing_submission:
+            existing_evaluation = db.query(Evaluation).filter(
+                Evaluation.submission_id == existing_submission.id
+            ).first()
+            existing_submission_reviewed = bool(
+                existing_evaluation and existing_evaluation.is_reviewed
+            )
     return UploadBatchFileResponse(
         id=item.id,
         filename=item.original_filename,
@@ -238,6 +262,8 @@ def _batch_file_response(db: Session, item: UploadBatchFile) -> UploadBatchFileR
         resolved_student_name=student.full_name if student else None,
         resolved_assignment_id=assignment.id if assignment else None,
         resolved_assignment_name=_assignment_label(assignment) if assignment else None,
+        existing_submission_id=existing_submission.id if existing_submission else None,
+        existing_submission_reviewed=existing_submission_reviewed,
         grading_status=submission_status.value if submission_status else None,
         error=item.error,
         warning=(
@@ -329,6 +355,7 @@ def list_teacher_upload_batches(
     )
     batch_ids = [batch.id for batch in batches]
     status_counts: dict[int, dict[str, int]] = {batch_id: {} for batch_id in batch_ids}
+    student_names: dict[int, list[str]] = {batch_id: [] for batch_id in batch_ids}
     if batch_ids:
         rows = (
             db.query(
@@ -342,6 +369,16 @@ def list_teacher_upload_batches(
         )
         for batch_id, file_status, count in rows:
             status_counts[batch_id][file_status.value] = count
+        matched_students = (
+            db.query(UploadBatchFile.batch_id, User.full_name)
+            .join(User, User.id == UploadBatchFile.resolved_student_id)
+            .filter(UploadBatchFile.batch_id.in_(batch_ids))
+            .order_by(User.full_name, User.id)
+            .all()
+        )
+        for batch_id, full_name in matched_students:
+            if full_name not in student_names[batch_id]:
+                student_names[batch_id].append(full_name)
     return {
         "items": [
             {
@@ -351,6 +388,7 @@ def list_teacher_upload_batches(
                 "file_count": batch.file_count,
                 "created_at": batch.created_at,
                 "counts": status_counts[batch.id],
+                "student_names": student_names[batch.id],
             }
             for batch in batches
         ],
@@ -700,11 +738,6 @@ def confirm_upload_file(
         UploadBatchFileStatus.DUPLICATE,
     }:
         raise HTTPException(status_code=409, detail="Upload file is not awaiting confirmation")
-    if item.status == UploadBatchFileStatus.DUPLICATE and not request.allow_duplicate:
-        raise HTTPException(
-            status_code=409,
-            detail="This file is a duplicate; set allow_duplicate to create another submission",
-        )
     student = db.query(User).filter(
         User.id == request.student_id,
         User.role == UserRole.STUDENT,
@@ -734,24 +767,40 @@ def confirm_upload_file(
             raise HTTPException(status_code=404, detail="Assignment not found")
     if not _student_is_eligible(db, assignment, student.id):
         raise HTTPException(status_code=422, detail="Student is not assigned to this assignment")
-    duplicate_exists = (
-        db.query(Submission.id)
+    existing_submission = (
+        db.query(Submission)
         .filter(
             Submission.student_id == student.id,
             Submission.assignment_id == assignment.id,
-            Submission.content_hash == item.content_hash,
         )
+        .with_for_update()
         .first()
-        is not None
     )
-    if duplicate_exists and not request.allow_duplicate:
+    previous_object_key = None
+    if existing_submission:
+        existing_evaluation = db.query(Evaluation).filter(
+            Evaluation.submission_id == existing_submission.id
+        ).first()
         item.status = UploadBatchFileStatus.DUPLICATE
-        item.error = "This student already has a submission with identical content for this assignment."
         item.resolved_student_id = student.id
         item.resolved_assignment_id = assignment.id
         item.match_status = StudentMatchStatus.CONFIRMED_BY_TEACHER
-        db.commit()
-        raise HTTPException(status_code=409, detail=item.error)
+        if existing_submission.status == SubmissionStatus.PROCESSING:
+            item.error = "The existing submission is still being processed and cannot be replaced."
+            db.commit()
+            raise HTTPException(status_code=409, detail=item.error)
+        if existing_evaluation and existing_evaluation.is_reviewed:
+            item.error = "The existing submission was reviewed by the teacher; reject this file instead."
+            db.commit()
+            raise HTTPException(status_code=409, detail=item.error)
+        if not request.replace_existing:
+            item.error = "This student already has a submission. Replace the existing submission or reject this file."
+            db.commit()
+            raise HTTPException(status_code=409, detail=item.error)
+        previous_object_key = _delete_submission_rows(db, existing_submission)
+        db.flush()
+    elif item.status == UploadBatchFileStatus.DUPLICATE:
+        item.status = UploadBatchFileStatus.MATCHED
 
     submission = Submission(
         student_id=student.id,
@@ -770,16 +819,24 @@ def confirm_upload_file(
         teacher_confirmed_by=teacher.id,
         teacher_confirmed_at=datetime.now(timezone.utc),
     )
-    db.add(submission)
-    db.flush()
-    item.resolved_student_id = student.id
-    item.resolved_assignment_id = assignment.id
-    item.submission_id = submission.id
-    item.match_status = StudentMatchStatus.CONFIRMED_BY_TEACHER
-    item.status = UploadBatchFileStatus.GRADING
-    item.error = None
-    item.failed_step = None
-    db.commit()
+    try:
+        db.add(submission)
+        db.flush()
+        item.resolved_student_id = student.id
+        item.resolved_assignment_id = assignment.id
+        item.submission_id = submission.id
+        item.match_status = StudentMatchStatus.CONFIRMED_BY_TEACHER
+        item.status = UploadBatchFileStatus.GRADING
+        item.error = None
+        item.failed_step = None
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="This student already has a submission for this assignment.",
+        ) from error
+    _delete_submission_file_best_effort(previous_object_key)
     background_tasks.add_task(process_upload_batch, batch.id, [item.id])
     return {"file_id": item.id, "submission_id": submission.id, "status": "grading"}
 
@@ -1073,20 +1130,19 @@ async def _process_batch_file(
 
     student_id = match.resolved_student_id
     assignment = eligible_assignments[0]
-    duplicate_exists = (
-        db.query(Submission.id)
+    existing_submission = (
+        db.query(Submission)
         .filter(
             Submission.student_id == student_id,
             Submission.assignment_id == assignment.id,
-            Submission.content_hash == item.content_hash,
         )
+        .order_by(Submission.created_at.desc(), Submission.id.desc())
         .first()
-        is not None
     )
     item.resolved_assignment_id = assignment.id
-    if duplicate_exists:
+    if existing_submission:
         item.status = UploadBatchFileStatus.DUPLICATE
-        item.error = "An identical submission already exists for this student and assignment."
+        item.error = "This student already has a submission for this assignment."
         db.commit()
         return
 

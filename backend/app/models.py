@@ -28,6 +28,7 @@ from app.services.roster_cells import normalize_roll_no
 
 JSON_LIST_TYPE = MutableList.as_mutable(JSON().with_variant(JSONB(), "postgresql"))
 JSON_DICT_TYPE = MutableDict.as_mutable(JSON().with_variant(JSONB(), "postgresql"))
+SUBMISSION_STUDENT_ASSIGNMENT_INDEX = "uq_submissions_student_assignment"
 
 
 class UserRole(str, enum.Enum):
@@ -227,19 +228,28 @@ class UploadBatchFile(Base):
 
 class Submission(Base):
     __tablename__ = "submissions"
+    __table_args__ = (
+        Index(
+            SUBMISSION_STUDENT_ASSIGNMENT_INDEX,
+            "student_id",
+            "assignment_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     student_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
     assignment_id: Mapped[int] = mapped_column(Integer, ForeignKey("assignments.id"), nullable=False, index=True)
     file_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     original_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    file_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # pdf, docx, code, image
+    file_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # pdf, docx, code
     status: Mapped[SubmissionStatus] = mapped_column(
         Enum(SubmissionStatus, native_enum=False, length=15),
         default=SubmissionStatus.UPLOADED,
     )
     extracted_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     extracted_code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    text_extraction_warning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     verification_verdict: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     verification_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -294,6 +304,18 @@ class Submission(Base):
     @property
     def student_name(self) -> Optional[str]:
         return self.student.full_name if self.student else None
+
+    @property
+    def can_resubmit(self) -> bool:
+        assignment = self.assignment
+        if not assignment or not assignment.is_active:
+            return False
+        if assignment.due_date is None:
+            return True
+        due_date = assignment.due_date
+        if due_date.tzinfo is None:
+            due_date = due_date.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) <= due_date
 
 
 class VerificationAttempt(Base):

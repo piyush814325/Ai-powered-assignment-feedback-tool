@@ -1,45 +1,18 @@
 import base64
 import io
-import logging
-import os
 from pathlib import Path
-import shutil
 from typing import List, Optional, Tuple
+import unicodedata
+import zipfile
 
 import pymupdf as fitz
-import pytesseract
 from docx import Document
-from PIL import Image
-
-from app.config import VERIFICATION_MIN_CONTENT_CHARS
-
-logger = logging.getLogger(__name__)
 
 
 class DocumentParser:
-    """Parses uploaded document bytes and extracts text, code, and images."""
+    """Parses uploaded document bytes and extracts text for accepted student file types."""
 
-    ALLOWED_EXTENSIONS = {
-        ".pdf", ".docx", ".txt", ".py", ".java", ".cpp", ".js", ".ts",
-        ".png", ".jpg", ".jpeg",
-    }
-
-    @staticmethod
-    def tesseract_available() -> bool:
-        command = pytesseract.pytesseract.tesseract_cmd
-        if os.path.dirname(command):
-            return os.path.isfile(command)
-        return shutil.which(command) is not None
-
-    @staticmethod
-    def _extract_ocr_text(image: Image.Image) -> str:
-        if not DocumentParser.tesseract_available():
-            return ""
-        try:
-            return pytesseract.image_to_string(image)
-        except Exception as error:
-            logger.warning("OCR failed; exception_type=%s", type(error).__name__)
-            return ""
+    ALLOWED_EXTENSIONS = {".pdf", ".docx", ".py", ".java", ".cpp", ".js", ".ts"}
 
     @staticmethod
     def parse_document(
@@ -51,44 +24,35 @@ class DocumentParser:
             return DocumentParser._parse_pdf(content)
         if file_ext == ".docx":
             return DocumentParser._parse_docx(content)
-        if file_ext in {".png", ".jpg", ".jpeg"}:
-            return DocumentParser._parse_image(content)
-        if file_ext in {".py", ".java", ".cpp", ".js", ".ts", ".txt"}:
-            return DocumentParser._parse_code(content, file_ext)
+        if file_ext in {".py", ".java", ".cpp", ".js", ".ts"}:
+            return DocumentParser._parse_code(content)
         raise ValueError(f"Unsupported file type: {file_ext}")
 
     @staticmethod
     def _parse_pdf(content: bytes) -> Tuple[str, None, Optional[List[str]], str]:
+        if not content.startswith(b"%PDF"):
+            raise ValueError("This file is not a valid PDF. Please upload a PDF file.")
         text = ""
-        images_base64 = []
         try:
             doc = fitz.open(stream=content, filetype="pdf")
+            extraction_flags = (
+                fitz.TEXTFLAGS_TEXT
+                & ~fitz.TEXT_PRESERVE_LIGATURES
+                & ~fitz.TEXT_USE_CID_FOR_UNKNOWN_UNICODE
+            )
             for page_num in range(doc.page_count):
                 page = doc.load_page(page_num)
-                page_text = page.get_text("text")
-                if (
-                    len(" ".join(str(page_text).split())) < VERIFICATION_MIN_CONTENT_CHARS
-                    and DocumentParser.tesseract_available()
-                ):
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                    page_image = Image.open(io.BytesIO(pix.tobytes("png")))
-                    ocr_text = DocumentParser._extract_ocr_text(page_image)
-                    if ocr_text.strip():
-                        page_text = f"{page_text}\n{ocr_text}"
+                page_text = unicodedata.normalize(
+                    "NFKC",
+                    page.get_text("text", flags=extraction_flags),
+                )
+                if not page_text.strip():
+                    raise ValueError("This PDF has no readable text. It looks scanned. Please upload a text-based PDF or a DOCX.")
                 text += f"--- Page {page_num + 1} ---\n{page_text}\n"
-
-                for image_info in page.get_images():
-                    try:
-                        pix = fitz.Pixmap(doc, image_info[0])
-                        if pix.n >= 5:
-                            pix = fitz.Pixmap(fitz.csRGB, pix)
-                        image_data = pix.tobytes("png")
-                        encoded = base64.b64encode(image_data).decode("utf-8")
-                        images_base64.append(f"data:image/png;base64,{encoded}")
-                    except Exception:
-                        continue
             doc.close()
-            return text, None, images_base64 or None, "pdf"
+            return text, None, None, "pdf"
+        except ValueError:
+            raise
         except Exception as error:
             raise ValueError(f"Error parsing PDF: {error}") from error
 
@@ -97,36 +61,37 @@ class DocumentParser:
         text = ""
         images_base64 = []
         try:
-            doc = Document(io.BytesIO(content))
-            for para in doc.paragraphs:
-                if para.text:
-                    text += para.text + "\n"
-            for table in doc.tables:
-                for row in table.rows:
-                    text += " | ".join(cell.text.strip() for cell in row.cells) + "\n"
-            for rel in doc.part.rels.values():
-                if (
-                    hasattr(rel, "target_ref")
-                    and "image" in str(rel.target_ref)
-                    and not getattr(rel, "is_external", False)
-                ):
-                    encoded = base64.b64encode(rel.target_part.blob).decode("utf-8")
-                    images_base64.append(f"data:image/png;base64,{encoded}")
+            if not zipfile.is_zipfile(io.BytesIO(content)):
+                raise ValueError("This DOCX is invalid. Please upload a readable DOCX file.")
+            with zipfile.ZipFile(io.BytesIO(content)) as zip_file:
+                names = set(zip_file.namelist())
+                if "word/document.xml" not in names:
+                    raise ValueError("This DOCX is invalid. Please upload a readable DOCX file.")
+                zip_file.read("word/document.xml")
+                doc = Document(io.BytesIO(content))
+                for para in doc.paragraphs:
+                    if para.text:
+                        text += para.text + "\n"
+                for table in doc.tables:
+                    for row in table.rows:
+                        text += " | ".join(cell.text.strip() for cell in row.cells) + "\n"
+                for rel in doc.part.rels.values():
+                    if (
+                        hasattr(rel, "target_ref")
+                        and "image" in str(rel.target_ref)
+                        and not getattr(rel, "is_external", False)
+                    ):
+                        encoded = base64.b64encode(rel.target_part.blob).decode("utf-8")
+                        images_base64.append(f"data:image/png;base64,{encoded}")
+                if not text.strip():
+                    raise ValueError("This DOCX has no readable text. Please upload a readable DOCX file.")
             return text, None, images_base64 or None, "docx"
+        except ValueError:
+            raise
         except Exception as error:
             raise ValueError(f"Error parsing DOCX: {error}") from error
 
     @staticmethod
-    def _parse_image(content: bytes) -> Tuple[str, None, Optional[List[str]], str]:
-        try:
-            image = Image.open(io.BytesIO(content))
-            text = DocumentParser._extract_ocr_text(image)
-            encoded = base64.b64encode(content).decode("utf-8")
-            return text, None, [f"data:image/png;base64,{encoded}"], "image"
-        except Exception as error:
-            raise ValueError(f"Error parsing image: {error}") from error
-
-    @staticmethod
-    def _parse_code(content: bytes, file_ext: str) -> Tuple[str, str, None, str]:
+    def _parse_code(content: bytes) -> Tuple[str, str, None, str]:
         code = content.decode("utf-8", errors="ignore")
-        return code, code, None, "code" if file_ext != ".txt" else "txt"
+        return code, code, None, "code"

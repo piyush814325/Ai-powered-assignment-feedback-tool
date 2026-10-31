@@ -47,6 +47,7 @@ from rapidfuzz import fuzz
 
 router = APIRouter(prefix="/assignments", tags=["assignments"])
 logger = logging.getLogger(__name__)
+ALLOWED_ASSIGNMENT_FILE_TYPES = ["pdf", "docx", "code"]
 _ACTIVE_UPLOAD_FILE_STATUSES = (
     UploadBatchFileStatus.PROCESSING,
     UploadBatchFileStatus.PARSED,
@@ -66,6 +67,24 @@ def _owned_assignment_or_404(
     if assignment is None:
         raise HTTPException(status_code=404, detail="Assignment not found")
     return assignment
+
+
+def normalize_allowed_file_types(values: list | None) -> list[str]:
+    if not values:
+        return ALLOWED_ASSIGNMENT_FILE_TYPES.copy()
+
+    normalized_values = {str(value).strip().lower().lstrip(".") for value in values}
+    explicit_supported = {"pdf", "docx"}.intersection(normalized_values)
+    if explicit_supported:
+        return [
+            file_type for file_type in ALLOWED_ASSIGNMENT_FILE_TYPES
+            if file_type in explicit_supported or file_type == "code" and "code" in normalized_values
+        ]
+
+    if {"code", "txt", "py", "java", "cpp", "js", "ts"}.intersection(normalized_values):
+        return ["pdf", "docx", "code"]
+
+    return ALLOWED_ASSIGNMENT_FILE_TYPES.copy()
 
 
 def _assignee_rows(db: Session, assignment: Assignment) -> list[dict]:
@@ -299,6 +318,15 @@ async def preview_assignment_assignee_import(
                     "unmatched": "unmatched",
                 }[match.match_status]
                 candidates = list(match.candidates)
+
+            candidate_models: list[AssigneeImportCandidate] = [
+                AssigneeImportCandidate(
+                    student_id=int(candidate["student_id"]),
+                    full_name=str(candidate["full_name"]),
+                    score=int(candidate["score"]),
+                )
+                for candidate in candidates
+            ]
             if topic:
                 rows_with_topic_count += 1
                 topic_score = max(
@@ -318,10 +346,7 @@ async def preview_assignment_assignee_import(
                     topic=topic,
                     topic_check=topic_check,
                     status=match_status,
-                    candidates=[
-                        AssigneeImportCandidate(**candidate)
-                        for candidate in candidates
-                    ],
+                    candidates=candidate_models,
                     topic_number=topic_result.topic_number,
                 )
             )
@@ -425,7 +450,7 @@ def assignment_response(assignment: Assignment) -> dict:
         "description": assignment.description,
         "due_date": assignment.due_date,
         "max_score": assignment.max_score,
-        "allowed_file_types": assignment.allowed_file_types or [],
+        "allowed_file_types": normalize_allowed_file_types(assignment.allowed_file_types),
         "rubric": assignment.rubric or [],
         "is_active": assignment.is_active,
         "submission_count": len(assignment.submissions),
@@ -457,8 +482,11 @@ def normalize_rubric(criteria: list) -> list:
 def validate_assignment(data: AssignmentCreate | AssignmentUpdate, existing: Assignment | None = None) -> list | None:
     if data.max_score is not None and data.max_score <= 0:
         raise HTTPException(status_code=400, detail="Max score must be greater than zero")
-    if data.allowed_file_types is not None and not data.allowed_file_types:
-        raise HTTPException(status_code=400, detail="Select at least one allowed file type")
+    if data.allowed_file_types is not None:
+        normalized = normalize_allowed_file_types(data.allowed_file_types)
+        if not normalized:
+            raise HTTPException(status_code=400, detail="Select at least one allowed file type")
+        data.allowed_file_types = normalized
     if data.due_date is not None:
         due_date = data.due_date
         if due_date.tzinfo is None:
@@ -484,6 +512,7 @@ def create_assignment(
     rubric = validate_assignment(assignment_data)
     payload = assignment_data.model_dump()
     payload["rubric"] = rubric or []
+    payload["allowed_file_types"] = normalize_allowed_file_types(payload.get("allowed_file_types"))
     assignment = Assignment(teacher_id=teacher.id, **payload)
     db.add(assignment)
     db.commit()
@@ -514,7 +543,7 @@ def list_assignments(
     assignments = query.order_by(Assignment.due_date.is_(None), Assignment.due_date, Assignment.created_at.desc()).all()
     responses = [assignment_response(assignment) for assignment in assignments]
     if current_user.role == UserRole.STUDENT and assignments:
-        topics = dict(
+        topic_rows = (
             db.query(AssignmentAssignee.assignment_id, AssignmentAssignee.topic_text)
             .filter(
                 AssignmentAssignee.student_id == current_user.id,
@@ -522,6 +551,9 @@ def list_assignments(
             )
             .all()
         )
+        topics: dict[int, str | None] = {
+            assignment_id: topic_text for assignment_id, topic_text in topic_rows
+        }
         for response in responses:
             response["student_topic"] = topics.get(response["id"])
     return responses
@@ -569,6 +601,8 @@ def update_assignment(
         raise HTTPException(status_code=409, detail="Rubric cannot be edited after students have submitted work")
     if rubric is not None:
         payload["rubric"] = rubric
+    if "allowed_file_types" in payload:
+        payload["allowed_file_types"] = normalize_allowed_file_types(payload["allowed_file_types"])
     for key, value in payload.items():
         setattr(assignment, key, value)
     db.commit()

@@ -22,7 +22,7 @@ class TeacherStudentsPage(BaseModel):
 class ConfirmUploadRequest(BaseModel):
     student_id: int
     assignment_id: int | None = None
-    allow_duplicate: bool = False
+    replace_existing: bool = False
 
 
 class RejectUploadRequest(BaseModel):
@@ -81,6 +81,7 @@ class TeacherUploadBatchSummary(BaseModel):
     file_count: int
     created_at: datetime
     counts: dict[str, int]
+    student_names: list[str] = Field(default_factory=list)
 
 
 class TeacherUploadBatchPage(BaseModel):
@@ -196,6 +197,8 @@ class UploadBatchFileResponse(BaseModel):
     resolved_student_name: str | None
     resolved_assignment_id: int | None
     resolved_assignment_name: str | None
+    existing_submission_id: int | None = None
+    existing_submission_reviewed: bool | None = None
     grading_status: str | None
     error: str | None
     warning: str | None = None

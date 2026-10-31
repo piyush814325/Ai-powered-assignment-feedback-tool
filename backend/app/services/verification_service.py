@@ -180,7 +180,7 @@ class SubmissionVerificationService:
         if len(normalized) < VERIFICATION_MIN_CONTENT_CHARS:
             verdict = "unverifiable" if has_images else "unreadable_or_empty"
             reason = (
-                "Images were present, but OCR did not extract enough text to verify the submission."
+                "The submission did not contain enough readable text or code to verify it."
                 if has_images
                 else "The file contains too little readable text or code to verify."
             )

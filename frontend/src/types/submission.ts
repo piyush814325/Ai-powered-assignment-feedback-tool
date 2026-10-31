@@ -33,6 +33,7 @@ export interface Submission {
     student_topic?: string | null;
     assignment_id: number;
     assignment?: Assignment;
+    can_resubmit: boolean;
     file_path: string | null;
     original_filename?: string | null;
     file_type: string | null;
@@ -40,6 +41,7 @@ export interface Submission {
     source?: 'student_upload' | 'teacher_upload' | null;
     extracted_text?: string | null;
     extracted_code?: string | null;
+    text_extraction_warning?: string | null;
     content_hash?: string | null;
     verification_verdict?: string;
     verification_confidence?: number | null;

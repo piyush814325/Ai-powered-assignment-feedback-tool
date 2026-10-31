@@ -6,6 +6,7 @@ import { Alert, Button, EmptyState, FormField, Select } from '../ui/components';
 
 interface UploadComponentProps {
     assignments: Assignment[];
+    submittedAssignmentIds: ReadonlySet<number>;
     onSuccess?: (closeUpload?: boolean) => void;
     submissionToReplace?: { id: number; assignment_id: number };
 }
@@ -14,7 +15,7 @@ interface ApiError {
     response?: { data?: { detail?: string } };
 }
 
-export default function UploadComponent({ assignments, onSuccess, submissionToReplace }: UploadComponentProps) {
+export default function UploadComponent({ assignments, submittedAssignmentIds, onSuccess, submissionToReplace }: UploadComponentProps) {
     const [file, setFile] = useState<File | null>(null);
     const [assignmentId, setAssignmentId] = useState(submissionToReplace ? String(submissionToReplace.assignment_id) : '');
     const [uploading, setUploading] = useState(false);
@@ -34,9 +35,7 @@ export default function UploadComponent({ assignments, onSuccess, submissionToRe
             const fileExtension = '.' + selectedFile.name.split('.').pop()?.toLowerCase();
             const fileType = ['py', 'java', 'cpp', 'js', 'ts'].includes(fileExtension.slice(1))
                 ? 'code'
-                : ['png', 'jpg', 'jpeg'].includes(fileExtension.slice(1))
-                    ? 'image'
-                    : fileExtension.slice(1);
+                : fileExtension.slice(1);
             if (!assignment.allowed_file_types.map((type) => type.toLowerCase()).includes(fileType) &&
                 !assignment.allowed_file_types.map((type) => type.toLowerCase()).includes(fileExtension.slice(1))) {
                 setError(`File type not allowed. This assignment accepts: ${assignment.allowed_file_types.join(', ')}`);
@@ -74,7 +73,7 @@ export default function UploadComponent({ assignments, onSuccess, submissionToRe
             return;
         }
         const assignment = assignments.find((item) => item.id === Number(assignmentId));
-        if (!assignment || (!replaceSubmissionId && assignment.due_date && new Date(assignment.due_date) < new Date())) {
+        if (!assignment || !assignment.is_active || (assignment.due_date && new Date(assignment.due_date) < new Date())) {
             setError('This assignment is closed or past its due date');
             return;
         }
@@ -126,12 +125,16 @@ export default function UploadComponent({ assignments, onSuccess, submissionToRe
                     <Select id="assignment-select" value={assignmentId} disabled={!!replaceSubmissionId} onChange={(e) => { setAssignmentId(e.target.value); setFile(null); }} required>
                         <option value="">Select an assignment</option>
                         {assignments.map((assignment) => {
-                            const closed = assignment.due_date ? new Date(assignment.due_date) < new Date() : false;
-                            return <option key={assignment.id} value={assignment.id} disabled={closed}>
-                                {assignment.subject_code} - {assignment.title}{closed ? ' (closed)' : ''}
+                            const closed = !assignment.is_active || (assignment.due_date ? new Date(assignment.due_date) < new Date() : false);
+                            const alreadySubmitted = !submissionToReplace && submittedAssignmentIds.has(assignment.id);
+                            return <option key={assignment.id} value={assignment.id} disabled={closed || alreadySubmitted}>
+                                {assignment.subject_code} - {assignment.title}{closed ? ' (closed)' : alreadySubmitted ? ' (already submitted)' : ''}
                             </option>;
                         })}
                     </Select>
+                    {!submissionToReplace && submittedAssignmentIds.size > 0 && (
+                        <p className="mt-1 text-xs text-muted-foreground">Already submitted. Delete it to resubmit.</p>
+                    )}
                 </FormField>
             )}
 
@@ -156,7 +159,7 @@ export default function UploadComponent({ assignments, onSuccess, submissionToRe
                         className="hidden"
                         id="file-input"
                         ref={fileInputRef}
-                        accept=".pdf,.docx,.txt,.py,.java,.cpp,.js,.ts,.png,.jpg,.jpeg"
+                        accept=".pdf,.docx,.py,.java,.cpp,.js,.ts"
                     />
                     <label htmlFor="file-input" className="cursor-pointer">
                         {file ? (
@@ -167,7 +170,7 @@ export default function UploadComponent({ assignments, onSuccess, submissionToRe
                         ) : (
                             <div>
                                 <p className="text-sm font-medium text-foreground">📁 Click to upload or drag and drop</p>
-                                <p className="text-xs text-muted-foreground mt-1">PDF, DOCX, Code files, or Images</p>
+                                <p className="text-xs text-muted-foreground mt-1">PDF, DOCX, or code files</p>
                             </div>
                         )}
                     </label>

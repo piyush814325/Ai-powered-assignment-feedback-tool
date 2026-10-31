@@ -109,10 +109,10 @@ export const teacherUploadsAPI = {
     deleteBatch: (batchId: number) => apiClient.delete(`/teacher/upload-batches/${batchId}`),
     deleteFile: (batchId: number, fileId: number) =>
         apiClient.delete(`/teacher/upload-batches/${batchId}/files/${fileId}`),
-    confirm: (batchId: number, fileId: number, studentId: number, assignmentId?: number, allowDuplicate = false) =>
+    confirm: (batchId: number, fileId: number, studentId: number, assignmentId?: number, replaceExisting = false) =>
         apiClient.post<UploadFileActionResult>(
             `/teacher/uploads/${batchId}/files/${fileId}/confirm`,
-            { student_id: studentId, assignment_id: assignmentId, allow_duplicate: allowDuplicate },
+            { student_id: studentId, assignment_id: assignmentId, replace_existing: replaceExisting },
         ),
     reject: (batchId: number, fileId: number, reason: string) =>
         apiClient.post<UploadFileActionResult>(
@@ -199,7 +199,7 @@ export function getApiErrorMessage(error: unknown): string {
 // Submissions API
 export const submissionsAPI = {
     remove: (submissionId: number) =>
-        apiClient.delete(`/student/submissions/${submissionId}`),
+        apiClient.delete(`/submissions/${submissionId}`),
 
     upload: (file: File, assignmentId: number, onUploadProgress?: (progress: { loaded: number; total?: number }) => void) => {
         const formData = new FormData();
@@ -233,6 +233,9 @@ export const submissionsAPI = {
 
     getSubmission: (submissionId: number) =>
         apiClient.get<Submission>(`/submissions/${submissionId}`),
+
+    getFile: (submissionId: number) =>
+        apiClient.get<Blob>(`/submissions/${submissionId}/file`, { responseType: 'blob' }),
 
     listSubmissions: (studentId?: number) =>
         apiClient.get<Submission[]>('/submissions/', { params: { student_id: studentId } }),

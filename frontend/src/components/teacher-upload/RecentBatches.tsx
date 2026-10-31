@@ -77,18 +77,17 @@ export function RecentBatches({ refreshVersion, onOpen }: RecentBatchesProps) {
                 <ul className="divide-y divide-border">
                     {batches.map((batch) => {
                         const classListCount = (batch.counts.roster_detected ?? 0) + (batch.counts.imported ?? 0);
+                        const studentNames = batch.student_names ?? [];
+                        const primaryName = studentNames.join(', ') || batch.name || `Batch #${batch.id}`;
                         return (
                         <li key={batch.id} className="flex flex-wrap items-center justify-between gap-3 py-3">
                             <div className="min-w-0 flex-1 space-y-1">
-                                <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1 text-sm font-medium text-foreground">
-                                    {batch.name ? (
-                                        <>
-                                            <span className="min-w-0 max-w-full truncate" title={batch.name}>{batch.name}</span>
-                                            <span className="shrink-0 text-xs font-normal text-muted-foreground">#{batch.id}</span>
-                                        </>
-                                    ) : (
-                                        <span>Batch #{batch.id}</span>
-                                    )}
+                                <p className="truncate text-base font-semibold text-foreground" title={primaryName}>
+                                    {primaryName}
+                                </p>
+                                <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1 text-sm text-muted-foreground">
+                                    {studentNames.length > 0 && <span className="truncate">{batch.name || `Batch #${batch.id}`}</span>}
+                                    {(studentNames.length > 0 || batch.name) && <span className="shrink-0 text-xs">#{batch.id}</span>}
                                     <span className="shrink-0 text-muted-foreground">
                                         {batch.file_count} file{batch.file_count === 1 ? '' : 's'}
                                     </span>

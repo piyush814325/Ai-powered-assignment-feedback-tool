@@ -2,14 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, Code2, Edit3, GraduationCap, ListChecks, Plus, RefreshCw, Trash2, Zap, Sparkles, UploadCloud } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { assignmentAssigneesAPI, assignmentsAPI, getApiErrorMessage, submissionsAPI } from '../services/api';
-import { Button, Card, Input, Badge, Spinner, EmptyState, Alert, FormField, Modal, Textarea } from '../ui/components';
+import { Button, Card, Input, Select, Badge, Spinner, EmptyState, Alert, FormField, Modal, Textarea } from '../ui/components';
 import { StatCard } from '../components/dashboard/StatCard';
 import { EvaluationCriteria } from '../components/dashboard/EvaluationCriteria';
 import { ClassificationBadges } from '../components/dashboard/ClassificationBadges';
 import { IssuesPanel } from '../components/dashboard/IssuesPanel';
 import { VisualContentWarning } from '../components/dashboard/VisualContentWarning';
 import ThemeToggle from '../components/ThemeToggle';
-import { formatDate, formatDateTime, submissionFileName, getSubmissionDisplayTitle } from '../lib/grading';
+import { formatDate, formatDateTime, submissionFileName } from '../lib/grading';
 import type { Submission } from '../types/submission';
 import type { Assignment, RubricCriterion } from '../types/assignment';
 import type { RosterImportSummary, TeacherStudent } from '../types/teacherUploads';
@@ -21,8 +21,10 @@ import { AssigneeTopicList } from '../components/teacher-upload/AssigneeTopicLis
 import { RosterImportModal, type RosterImportSource } from '../components/teacher-upload/roster/RosterImportModal';
 import type { AssigneeList } from '../types/teacherUploads';
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal';
+import { FileViewer } from '../components/FileViewer';
 
 type FilterTab = 'pending' | 'reviewed' | 'attention' | 'all';
+type SubmissionSort = 'newest' | 'student_name';
 
 interface ApiError {
     response?: { data?: { detail?: string } };
@@ -59,6 +61,7 @@ export default function TeacherDashboard() {
     const [selectedSubmission, setSelectedSubmission] = useState<Submission | null>(null);
     const [filterTab, setFilterTab] = useState<FilterTab>('pending');
     const [searchTerm, setSearchTerm] = useState('');
+    const [submissionSort, setSubmissionSort] = useState<SubmissionSort>('newest');
 
     const [editedScores, setEditedScores] = useState<Record<string, number>>({});
     const [editedFeedback, setEditedFeedback] = useState<Record<string, string>>({});
@@ -96,7 +99,7 @@ export default function TeacherDashboard() {
     const [assigneeDetails, setAssigneeDetails] = useState<AssigneeList['students']>([]);
     const [savingAssignment, setSavingAssignment] = useState(false);
     const [assignmentForm, setAssignmentForm] = useState({
-        subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code', 'image'], rubric: emptyRubric(), is_active: true,
+        subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code'], rubric: emptyRubric(), is_active: true,
     });
 
     useEffect(() => {
@@ -182,7 +185,7 @@ export default function TeacherDashboard() {
             subject_name: assignment.subject_name, subject_code: assignment.subject_code, title: assignment.title,
             description: assignment.description ?? '', due_date: assignment.due_date ? assignment.due_date.slice(0, 16) : '',
             max_score: String(assignment.max_score), allowed_file_types: assignment.allowed_file_types, rubric: assignment.rubric, is_active: assignment.is_active,
-        } : { subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code', 'image'], rubric: emptyRubric(), is_active: true });
+        } : { subject_name: '', subject_code: '', title: '', description: '', due_date: '', max_score: '100', allowed_file_types: ['pdf', 'docx', 'code'], rubric: emptyRubric(), is_active: true });
         if (assignment) {
             try {
                 const response = await assignmentAssigneesAPI.get(assignment.id);
@@ -378,8 +381,8 @@ export default function TeacherDashboard() {
     };
 
     const filteredSubmissions = useMemo(
-        () =>
-            submissions.filter((s) => {
+        () => {
+            const filtered = submissions.filter((s) => {
                 const matchesTab =
                     filterTab === 'pending'
                         ? s.evaluation && !s.evaluation.is_reviewed
@@ -388,13 +391,27 @@ export default function TeacherDashboard() {
                             : filterTab === 'attention'
                                 ? s.status === 'needs_attention'
                                 : true;
-                const query = searchTerm.toLowerCase();
-                const displayTitle = getSubmissionDisplayTitle(s);
+                const query = searchTerm.trim().toLocaleLowerCase();
                 const matchesSearch =
-                    displayTitle.toLowerCase().includes(query) || s.student_id.toString().includes(searchTerm);
+                    !query
+                    || (s.student_name || `Student #${s.student_id}`).toLocaleLowerCase().includes(query)
+                    || (s.assignment?.title || '').toLocaleLowerCase().includes(query)
+                    || (s.assignment?.subject_code || '').toLocaleLowerCase().includes(query);
                 return matchesTab && matchesSearch;
-            }),
-        [submissions, filterTab, searchTerm],
+            });
+            return filtered.sort((first, second) => {
+                if (submissionSort === 'student_name') {
+                    const byName = (first.student_name || `Student #${first.student_id}`).localeCompare(
+                        second.student_name || `Student #${second.student_id}`,
+                        undefined,
+                        { sensitivity: 'base' },
+                    );
+                    if (byName !== 0) return byName;
+                }
+                return new Date(second.created_at).getTime() - new Date(first.created_at).getTime();
+            });
+        },
+        [submissions, filterTab, searchTerm, submissionSort],
     );
 
     const evaluatedCount = submissions.filter((s) => s.evaluation?.total_score != null).length;
@@ -460,14 +477,24 @@ export default function TeacherDashboard() {
                                 onOpen={openRecentBatch}
                             />
 
-                            <Input
-                                type="text"
-                                placeholder="Search by assignment or student…"
-                                value={searchTerm}
-                                onChange={(e) => setSearchTerm(e.target.value)}
-                                className="text-xs"
-                                aria-label="Search submissions"
-                            />
+                            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem]">
+                                <Input
+                                    type="text"
+                                    placeholder="Search student, assignment, or subject code"
+                                    value={searchTerm}
+                                    onChange={(e) => setSearchTerm(e.target.value)}
+                                    className="text-xs"
+                                    aria-label="Search submissions by student, assignment, or subject code"
+                                />
+                                <Select
+                                    value={submissionSort}
+                                    onChange={(event) => setSubmissionSort(event.target.value as SubmissionSort)}
+                                    aria-label="Sort submissions"
+                                >
+                                    <option value="newest">Newest first</option>
+                                    <option value="student_name">Student name A-Z</option>
+                                </Select>
+                            </div>
 
                             <div className="flex border-b border-border text-xs font-semibold" role="tablist">
                                 {(
@@ -510,6 +537,17 @@ export default function TeacherDashboard() {
                             <div className="space-y-3 max-h-[700px] overflow-y-auto pr-1">
                                 {filteredSubmissions.map((sub) => {
                                     const isSelected = selectedSubmission?.id === sub.id;
+                                    const studentName = sub.student_name || `Student #${sub.student_id}`;
+                                    const statusLabel = sub.evaluation
+                                        ? sub.evaluation.is_reviewed ? 'Approved' : 'Needs review'
+                                        : sub.status === 'pending_teacher_review'
+                                            ? 'Pending teacher review'
+                                            : sub.status.replaceAll('_', ' ');
+                                    const statusVariant = sub.evaluation
+                                        ? sub.evaluation.is_reviewed ? 'success' : 'warning'
+                                        : ['failed', 'needs_attention'].includes(sub.status)
+                                            ? 'danger'
+                                            : sub.status === 'processing' ? 'info' : 'neutral';
                                     return (
                                         <Card
                                             key={sub.id}
@@ -521,41 +559,32 @@ export default function TeacherDashboard() {
                                             }
                                             onClick={() => setSelectedSubmission(sub)}
                                         >
-                                            <div className="flex justify-between items-start gap-2">
-                                                <div className="min-w-0">
-                                                    <div className="flex flex-wrap items-center gap-2">
-                                                        <h3 className="font-bold text-foreground text-sm truncate">{getSubmissionDisplayTitle(sub)}</h3>
-                                                        {sub.file_type && (
-                                                            <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-muted text-muted-foreground shrink-0">
-                                                                {sub.file_type}
-                                                            </span>
-                                                        )}
+                                            <div className="flex justify-between items-start gap-3">
+                                                <div className="min-w-0 space-y-1">
+                                                    <h3 className="truncate text-base font-bold text-foreground">{studentName}</h3>
+                                                    <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                                                        <span className="truncate font-medium text-foreground">
+                                                            {sub.assignment?.title || 'Assignment'}
+                                                            {sub.assignment?.subject_code ? ` · ${sub.assignment.subject_code}` : ''}
+                                                        </span>
+                                                        {sub.file_type && <Badge variant="neutral">{sub.file_type}</Badge>}
                                                         {sub.source === 'teacher_upload' && <Badge variant="info">Uploaded by teacher</Badge>}
                                                     </div>
-                                                    <p className="text-xs text-muted-foreground mt-1">
-                                                        {sub.student_name || `Student #${sub.student_id}`}
-                                                    </p>
-                                                    {sub.student_topic && <p className="text-xs text-muted-foreground">Topic: {sub.student_topic}</p>}
-                                                    <p className="text-[11px] text-muted-foreground">{formatDate(sub.created_at)}</p>
-                                                    {sub.status === 'needs_attention' && <Badge variant="danger" className="mt-2">Needs attention</Badge>}
+                                                    <p className="text-[11px] text-muted-foreground">Submitted {formatDate(sub.created_at)}</p>
                                                 </div>
-
-                                                {sub.evaluation && (
-                                                    <div className="text-right shrink-0">
-                                                        <span className="text-2xl font-black text-purple-600 dark:text-purple-400">
-                                                            {sub.evaluation.total_score?.toFixed(1)}
-                                                        </span>
-                                                        <p className="text-[10px] text-muted-foreground">
-                                                            {((sub.evaluation.ai_confidence ?? 0) * 100).toFixed(0)}% AI conf.
-                                                        </p>
-                                                        <Badge
-                                                            variant={sub.evaluation.is_reviewed ? 'success' : 'warning'}
-                                                            className="mt-1"
-                                                        >
-                                                            {sub.evaluation.is_reviewed ? 'Approved' : 'Needs review'}
-                                                        </Badge>
-                                                    </div>
-                                                )}
+                                                <div className="shrink-0 space-y-1 text-right">
+                                                    {sub.evaluation && (
+                                                        <>
+                                                            <span className="block text-2xl font-black text-purple-600 dark:text-purple-400">
+                                                                {sub.evaluation.total_score?.toFixed(1)}
+                                                            </span>
+                                                            <p className="text-[10px] text-muted-foreground">
+                                                                {((sub.evaluation.ai_confidence ?? 0) * 100).toFixed(0)}% AI conf.
+                                                            </p>
+                                                        </>
+                                                    )}
+                                                    <Badge variant={statusVariant}>{statusLabel}</Badge>
+                                                </div>
                                             </div>
                                         </Card>
                                     );
@@ -571,14 +600,17 @@ export default function TeacherDashboard() {
                                 <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-4 pb-4 border-b border-border">
                                     <div className="min-w-0">
                                         <div className="flex flex-wrap items-center gap-2">
-                                            <h2 className="text-2xl font-extrabold text-foreground truncate">
-                                                {getSubmissionDisplayTitle(selectedSubmission)}
-                                            </h2>
-                                            <Badge className="bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300 shrink-0">
+                                            <h2 className="truncate text-2xl font-extrabold text-foreground">
                                                 {selectedSubmission.student_name || `Student #${selectedSubmission.student_id}`}
-                                            </Badge>
+                                            </h2>
                                             {selectedSubmission.source === 'teacher_upload' && <Badge variant="info">Uploaded by teacher</Badge>}
                                         </div>
+                                        <p className="mt-1 text-sm text-muted-foreground">
+                                            {selectedSubmission.assignment?.title || 'Assignment'}
+                                            {selectedSubmission.assignment?.subject_code
+                                                ? ` · ${selectedSubmission.assignment.subject_code}`
+                                                : ''}
+                                        </p>
                                         {selectedSubmission.student_topic && (
                                             <p className="mt-2 text-sm text-muted-foreground">Student topic: {selectedSubmission.student_topic}</p>
                                         )}
@@ -607,6 +639,10 @@ export default function TeacherDashboard() {
                                         </Button>
                                     </div>
                                 </div>
+
+                                {selectedSubmission.text_extraction_warning && (
+                                    <Alert variant="warning">{selectedSubmission.text_extraction_warning}</Alert>
+                                )}
 
                                 {saveSuccess && (
                                     <Alert variant="success">
@@ -675,18 +711,7 @@ export default function TeacherDashboard() {
                                 </div>
 
                                 {showSourceCode ? (
-                                    <div className="space-y-3">
-                                        <h3 className="text-sm font-bold text-foreground">Extracted file content</h3>
-                                        {selectedSubmission.extracted_text || selectedSubmission.extracted_code ? (
-                                            <pre className="p-4 bg-slate-950 text-slate-100 rounded-xl overflow-x-auto text-xs font-mono whitespace-pre-wrap max-h-[500px]">
-                                                {selectedSubmission.extracted_code || selectedSubmission.extracted_text}
-                                            </pre>
-                                        ) : (
-                                            <p className="text-sm text-muted-foreground italic p-4 border border-border rounded-lg">
-                                                No extracted text found for this submission.
-                                            </p>
-                                        )}
-                                    </div>
+                                    <FileViewer key={selectedSubmission.id} submission={selectedSubmission} />
                                 ) : selectedSubmission.evaluation ? (
                                     <div className="space-y-6">
                                         <div className="flex justify-between items-center bg-purple-50 dark:bg-purple-950/30 p-4 rounded-xl border border-purple-100 dark:border-purple-900/40">
@@ -875,7 +900,7 @@ export default function TeacherDashboard() {
                         {assignmentForm.rubric.reduce((sum, criterion) => sum + Number(criterion.max_points || 0), 0) !== Number(assignmentForm.max_score) && <Alert variant="warning">Rubric points must equal the assignment max score before it can be saved.</Alert>}
                         <Button type="button" variant="outline" size="sm" onClick={() => setAssignmentForm((prev) => ({ ...prev, rubric: [...prev.rubric, { key: '', label: '', description: '', max_points: 0 }] }))}><Plus className="h-4 w-4" />Add criterion</Button>
                     </fieldset>
-                    <fieldset><legend className="block text-sm font-medium text-foreground mb-1.5">Allowed file types</legend><div className="flex flex-wrap gap-4">{['pdf', 'docx', 'txt', 'code', 'image'].map((type) => <label key={type} className="flex items-center gap-2 text-sm text-foreground"><input type="checkbox" checked={assignmentForm.allowed_file_types.includes(type)} onChange={(e) => setAssignmentForm({ ...assignmentForm, allowed_file_types: e.target.checked ? [...assignmentForm.allowed_file_types, type] : assignmentForm.allowed_file_types.filter((item) => item !== type) })} />{type.toUpperCase()}</label>)}</div></fieldset>
+                    <fieldset><legend className="block text-sm font-medium text-foreground mb-1.5">Allowed file types</legend><div className="flex flex-wrap gap-4">{['pdf', 'docx', 'code'].map((type) => <label key={type} className="flex items-center gap-2 text-sm text-foreground"><input type="checkbox" checked={assignmentForm.allowed_file_types.includes(type)} onChange={(e) => setAssignmentForm({ ...assignmentForm, allowed_file_types: e.target.checked ? [...assignmentForm.allowed_file_types, type] : assignmentForm.allowed_file_types.filter((item) => item !== type) })} />{type.toUpperCase()}</label>)}</div></fieldset>
                     <div className="flex flex-wrap justify-end gap-2 pt-2">
                         <Button type="button" variant="outline" onClick={(event) => void saveAssignment(event, true)} disabled={savingAssignment}>Import student roster</Button>
                         <Button type="button" variant="outline" onClick={() => setShowAssignmentModal(false)} disabled={savingAssignment}>Cancel</Button>

@@ -113,6 +113,7 @@ class SubmissionResponse(BaseModel):
     student_name: Optional[str] = None
     assignment_id: int
     assignment: Optional[AssignmentResponse] = None
+    can_resubmit: bool
     file_path: Optional[str]
     original_filename: Optional[str] = None
     file_type: str
@@ -120,6 +121,7 @@ class SubmissionResponse(BaseModel):
     source: Optional[str] = None
     extracted_text: Optional[str] = None
     extracted_code: Optional[str] = None
+    text_extraction_warning: Optional[str] = None
     content_hash: Optional[str] = None
     verification_verdict: Optional[str] = None
     verification_confidence: Optional[float] = None

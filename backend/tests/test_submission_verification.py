@@ -1,11 +1,14 @@
 import asyncio
 import io
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import UploadFile
-from PIL import Image
+from fastapi import HTTPException, UploadFile
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from uuid import uuid4
@@ -15,11 +18,14 @@ from app.models import (
     Assignment,
     AssignmentAssignee,
     Evaluation,
+    Feedback,
     Rubric,
     Submission,
+    SubmissionSource,
     SubmissionStatus,
     User,
     UserRole,
+    VerificationAttempt,
 )
 from app.routers import submissions as submission_router
 from app.schemas.schemas import VerificationOverrideRequest
@@ -77,7 +83,7 @@ def setup_assignment(db):
         title="Implement a binary search tree",
         description="Implement insertion and lookup in a binary search tree.",
         max_score=100,
-        allowed_file_types=["code", "pdf", "txt", "image"],
+        allowed_file_types=["code", "pdf"],
         rubric=[{"key": "correctness", "label": "Correctness", "description": "Correct solution", "max_points": 100}],
         is_active=True,
     )
@@ -95,9 +101,10 @@ def create_submission(db, student, assignment, *, status=SubmissionStatus.UPLOAD
         student_id=student.id,
         assignment_id=assignment.id,
         file_path="unused.txt",
-        file_type="txt",
+        file_type="code",
         status=status,
         content_hash=content_hash,
+        source=SubmissionSource.STUDENT_UPLOAD,
     )
     db.add(submission)
     db.commit()
@@ -116,7 +123,7 @@ def stub_pipeline(monkeypatch, text_content="An intentionally weak binary search
     monkeypatch.setattr(
         submission_router.DocumentParser,
         "parse_document",
-        lambda *_args: (text_content, None, None, "txt"),
+        lambda *_args: (text_content, None, None, "code"),
     )
 
     async def classify(*_args):
@@ -259,7 +266,7 @@ def test_same_content_on_another_assignment_is_evidence(db, monkeypatch):
         title="Normalize a relational schema",
         description="Describe normal forms and normalize a schema.",
         max_score=100,
-        allowed_file_types=["code", "pdf", "txt", "image"],
+        allowed_file_types=["code", "pdf"],
         rubric=[{"key": "correctness", "label": "Correctness", "description": "Correct solution", "max_points": 100}],
         is_active=True,
     )
@@ -442,6 +449,10 @@ def test_partial_or_low_confidence_mismatch_is_graded(db, monkeypatch, verdict, 
 
 def test_same_assignment_duplicate_is_flagged_but_graded(db, monkeypatch):
     _, student, assignment = setup_assignment(db)
+    with db.get_bind().begin() as connection:
+        connection.exec_driver_sql(
+            "DROP INDEX uq_submissions_student_assignment"
+        )
     content = "A sufficiently long answer about binary search trees and their operations."
     content_hash = SubmissionVerificationService.content_hash(content, None)
     create_submission(db, student, assignment, content_hash=content_hash)
@@ -471,23 +482,13 @@ def test_unusable_scanned_ocr_is_unverifiable_but_graded(db, monkeypatch):
     assert result["evaluation"] is not None
 
 
-def test_pdf_parser_merges_ocr_text_for_scanned_pages(monkeypatch):
-    image_bytes = io.BytesIO()
-    Image.new("RGB", (4, 4), color="white").save(image_bytes, format="PNG")
-
-    class Pixmap:
-        width = 4
-        height = 4
-
-        def tobytes(self, _format):
-            return image_bytes.getvalue()
-
+def test_pdf_parser_rejects_scanned_or_blank_pages_without_readable_text(monkeypatch):
     class Page:
-        def get_text(self, _mode):
+        def get_text(self, _mode, flags=None):
+            assert flags is not None
+            assert flags & document_parser.fitz.TEXT_PRESERVE_LIGATURES == 0
+            assert flags & document_parser.fitz.TEXT_USE_CID_FOR_UNKNOWN_UNICODE == 0
             return ""
-
-        def get_pixmap(self, **_kwargs):
-            return Pixmap()
 
         def get_images(self):
             return []
@@ -502,22 +503,430 @@ def test_pdf_parser_merges_ocr_text_for_scanned_pages(monkeypatch):
             return None
 
     monkeypatch.setattr(document_parser.fitz, "open", lambda **_kwargs: Document())
-    monkeypatch.setattr(DocumentParser, "tesseract_available", staticmethod(lambda: True))
-    monkeypatch.setattr(document_parser.pytesseract, "image_to_string", lambda _image: "OCR extracted assignment text")
-    text_content, _, _, _ = DocumentParser._parse_pdf(b"scanned.pdf")
-    assert "OCR extracted assignment text" in text_content
+
+    with pytest.raises(ValueError, match="no readable text|scanned"):
+        DocumentParser._parse_pdf(b"%PDF-1.7")
 
 
-def test_image_parser_skips_ocr_when_tesseract_is_unavailable(monkeypatch):
-    image_bytes = io.BytesIO()
-    Image.new("RGB", (4, 4), color="white").save(image_bytes, format="PNG")
-    monkeypatch.setattr(DocumentParser, "tesseract_available", staticmethod(lambda: False))
+def test_synthetic_pdf_ligatures_are_expanded_and_normalized():
+    font_path = Path("C:/Windows/Fonts/arial.ttf")
+    if not font_path.is_file():
+        pytest.skip("Synthetic ligature fixture requires an installed Unicode font")
+    pdf = document_parser.fitz.open()
+    page = pdf.new_page()
+    page.insert_text(
+        (72, 72),
+        "o\ufb03ce",
+        fontname="arial",
+        fontfile=str(font_path),
+    )
+    content = pdf.tobytes()
+    pdf.close()
 
-    text_content, _, images, file_type = DocumentParser._parse_image(image_bytes.getvalue())
+    extracted, _, _, _ = DocumentParser._parse_pdf(content)
 
-    assert text_content == ""
-    assert images
-    assert file_type == "image"
+    assert "office" in extracted
+    assert "\ufb03" not in extracted
+
+
+def test_pdf_replacement_characters_store_teacher_warning(db, monkeypatch):
+    _, student, assignment = setup_assignment(db)
+    submission = create_submission(db, student, assignment)
+
+    class Storage:
+        def read(self, _object_key):
+            return b"synthetic pdf payload"
+
+    monkeypatch.setattr(submission_router, "get_storage", lambda: Storage())
+    monkeypatch.setattr(
+        DocumentParser,
+        "parse_document",
+        lambda *_args: ("A readable synthetic passage \ufffd\ufffd\ufffd", None, None, "pdf"),
+    )
+
+    asyncio.run(submission_router._verify_submission_file(submission, db, True))
+
+    assert submission.text_extraction_warning == (
+        "Some characters could not be read. Review the original file before approving the grade."
+    )
+
+
+def test_legacy_txt_and_image_types_are_rejected_by_parser():
+    with pytest.raises(ValueError, match="Unsupported file type"):
+        DocumentParser.parse_document(b"hello world", "notes.txt")
+
+    with pytest.raises(ValueError, match="Unsupported file type"):
+        DocumentParser.parse_document(b"uploaded image", "scan.png")
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [("invalid.pdf", b"not a PDF"), ("invalid.docx", b"not a ZIP archive")],
+)
+def test_student_upload_rejects_invalid_pdf_and_docx_containers(db, filename, content):
+    _, student, assignment = setup_assignment(db)
+    assignment.allowed_file_types = ["pdf", "docx", "code"]
+    db.commit()
+    upload = UploadFile(filename=filename, file=io.BytesIO(content))
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            submission_router.upload_submission(upload, assignment.id, student, db)
+        )
+
+    assert error.value.status_code == 415
+
+
+def test_student_upload_rejects_docx_without_document_xml(db):
+    _, student, assignment = setup_assignment(db)
+    assignment.allowed_file_types = ["pdf", "docx", "code"]
+    db.commit()
+    invalid_docx = io.BytesIO()
+    with zipfile.ZipFile(invalid_docx, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+    upload = UploadFile(filename="missing-document.docx", file=io.BytesIO(invalid_docx.getvalue()))
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            submission_router.upload_submission(upload, assignment.id, student, db)
+        )
+
+    assert error.value.status_code == 415
+
+
+def test_student_second_upload_conflicts_then_delete_allows_resubmission(db, monkeypatch):
+    _, student, assignment = setup_assignment(db)
+
+    class Storage:
+        def __init__(self):
+            self.deleted = []
+            self.saved = 0
+
+        def save(self, *_args):
+            self.saved += 1
+            return f"submissions/synthetic-{self.saved}.py"
+
+        def delete(self, object_key):
+            self.deleted.append(object_key)
+
+    storage = Storage()
+    monkeypatch.setattr(submission_router, "get_storage", lambda: storage)
+
+    def upload():
+        return asyncio.run(
+            submission_router.upload_submission(
+                UploadFile(filename="solution.py", file=io.BytesIO(b"print('synthetic')")),
+                assignment.id,
+                student,
+                db,
+            )
+        )
+
+    first = upload()
+    with pytest.raises(HTTPException) as duplicate_error:
+        upload()
+    assert duplicate_error.value.status_code == 409
+    assert duplicate_error.value.detail == submission_router.STUDENT_DUPLICATE_DETAIL
+
+    response = submission_router.delete_student_submission(first.id, student, db)
+    assert response.status_code == 204
+    assert storage.deleted == ["submissions/synthetic-1.py"]
+    assert upload().assignment_id == assignment.id
+
+
+def test_student_upload_integrity_race_returns_same_conflict(db, monkeypatch):
+    _, student, assignment = setup_assignment(db)
+
+    class Storage:
+        deleted = []
+
+        def save(self, *_args):
+            return "submissions/raced.py"
+
+        def delete(self, object_key):
+            self.deleted.append(object_key)
+
+    storage = Storage()
+    monkeypatch.setattr(submission_router, "get_storage", lambda: storage)
+
+    def lose_unique_race():
+        raise IntegrityError("insert", {}, RuntimeError("unique conflict"))
+
+    monkeypatch.setattr(db, "commit", lose_unique_race)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            submission_router.upload_submission(
+                UploadFile(filename="solution.py", file=io.BytesIO(b"print('synthetic')")),
+                assignment.id,
+                student,
+                db,
+            )
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == submission_router.STUDENT_DUPLICATE_DETAIL
+    assert storage.deleted == ["submissions/raced.py"]
+
+
+def test_student_delete_before_review_removes_related_rows_and_file(db, monkeypatch):
+    _, student, assignment = setup_assignment(db)
+    submission = create_submission(db, student, assignment)
+    evaluation = Evaluation(
+        submission_id=submission.id,
+        rubric_id=_rubric_id(db),
+        total_score=10,
+        scores={"correctness": 10},
+        feedback={"correctness": "Synthetic feedback."},
+        evidence={"correctness": "Synthetic evidence."},
+        is_reviewed=False,
+    )
+    db.add(evaluation)
+    db.flush()
+    db.add(Feedback(evaluation_id=evaluation.id, feedback_text="Synthetic feedback."))
+    db.add(VerificationAttempt(
+        submission_id=submission.id,
+        student_id=student.id,
+        assignment_id=assignment.id,
+    ))
+    db.commit()
+
+    deleted_keys = []
+
+    class Storage:
+        def delete(self, object_key):
+            deleted_keys.append(object_key)
+
+    monkeypatch.setattr(submission_router, "get_storage", lambda: Storage())
+    response = submission_router.delete_student_submission(submission.id, student, db)
+
+    assert response.status_code == 204
+    assert deleted_keys == ["unused.txt"]
+    assert db.query(Submission).filter(Submission.id == submission.id).first() is None
+    assert db.query(Evaluation).filter(Evaluation.submission_id == submission.id).count() == 0
+    assert db.query(Feedback).filter(Feedback.evaluation_id == evaluation.id).count() == 0
+    assert db.query(VerificationAttempt).filter(
+        VerificationAttempt.submission_id == submission.id
+    ).count() == 0
+
+
+def test_student_delete_commits_when_storage_cleanup_fails(db, monkeypatch, caplog):
+    _, student, assignment = setup_assignment(db)
+    submission = create_submission(db, student, assignment)
+
+    class BrokenStorage:
+        def delete(self, _object_key):
+            raise OSError("storage unavailable")
+
+    monkeypatch.setattr(submission_router, "get_storage", lambda: BrokenStorage())
+    response = submission_router.delete_student_submission(submission.id, student, db)
+
+    assert response.status_code == 204
+    assert db.query(Submission).filter(Submission.id == submission.id).first() is None
+    assert "object_key=unused.txt" in caplog.text
+    assert "storage unavailable" not in caplog.text
+
+
+def test_student_delete_after_review_gets_conflict(db):
+    _, student, assignment = setup_assignment(db)
+    submission = create_submission(db, student, assignment)
+    db.add(Evaluation(
+        submission_id=submission.id,
+        rubric_id=_rubric_id(db),
+        is_reviewed=True,
+    ))
+    db.commit()
+
+    with pytest.raises(HTTPException) as error:
+        submission_router.delete_student_submission(submission.id, student, db)
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "This submission was already reviewed by your teacher and can't be deleted."
+
+
+def test_submission_processing_blocks_student_delete(db):
+    _, student, assignment = setup_assignment(db)
+    submission = create_submission(
+        db, student, assignment, status=SubmissionStatus.PROCESSING
+    )
+
+    with pytest.raises(HTTPException) as error:
+        submission_router.delete_student_submission(submission.id, student, db)
+
+    assert error.value.status_code == 409
+    assert "currently being processed" in error.value.detail
+    assert "Try again in a few minutes" in error.value.detail
+
+
+def test_stale_processing_submission_can_be_deleted(db, monkeypatch):
+    _, student, assignment = setup_assignment(db)
+    now = datetime.now(timezone.utc)
+    submission = Submission(
+        student_id=student.id,
+        assignment_id=assignment.id,
+        file_path="stale-processing.py",
+        file_type="code",
+        status=SubmissionStatus.PROCESSING,
+        source=SubmissionSource.STUDENT_UPLOAD,
+        updated_at=now - timedelta(minutes=16),
+    )
+    db.add(submission)
+    db.commit()
+
+    class Storage:
+        def delete(self, _object_key):
+            return None
+
+    monkeypatch.setattr(submission_router, "get_storage", lambda: Storage())
+    response = submission_router.delete_student_submission(submission.id, student, db)
+    assert response.status_code == 204
+    assert db.query(Submission).filter(Submission.id == submission.id).first() is None
+
+
+def test_startup_sweep_marks_only_stale_student_processing_rows_failed(db):
+    _, student, assignment = setup_assignment(db)
+    other_student = User(
+        email="fresh-student@example.test",
+        full_name="Synthetic Fresh Student",
+        hashed_password="hash",
+        role=UserRole.STUDENT,
+    )
+    teacher_upload_student = User(
+        email="teacher-upload-student@example.test",
+        full_name="Synthetic Teacher Upload Student",
+        hashed_password="hash",
+        role=UserRole.STUDENT,
+    )
+    db.add_all([other_student, teacher_upload_student])
+    db.flush()
+    now = datetime.now(timezone.utc)
+    stale = Submission(
+        student_id=student.id,
+        assignment_id=assignment.id,
+        file_path="stale.py",
+        status=SubmissionStatus.PROCESSING,
+        source=SubmissionSource.STUDENT_UPLOAD,
+        updated_at=now - timedelta(minutes=16),
+    )
+    fresh = Submission(
+        student_id=other_student.id,
+        assignment_id=assignment.id,
+        file_path="fresh.py",
+        status=SubmissionStatus.PROCESSING,
+        source=SubmissionSource.STUDENT_UPLOAD,
+        updated_at=now - timedelta(minutes=5),
+    )
+    teacher_upload = Submission(
+        student_id=teacher_upload_student.id,
+        assignment_id=assignment.id,
+        file_path="teacher-upload.csv",
+        status=SubmissionStatus.PROCESSING,
+        source=SubmissionSource.TEACHER_UPLOAD,
+        updated_at=now - timedelta(minutes=16),
+    )
+    db.add_all([stale, fresh, teacher_upload])
+    db.commit()
+
+    count = submission_router.sweep_stale_student_submissions(
+        db, now=now, timeout_minutes=15
+    )
+
+    assert count == 1
+    db.refresh(stale)
+    db.refresh(fresh)
+    db.refresh(teacher_upload)
+    assert stale.status == SubmissionStatus.FAILED
+    assert stale.verification_error_code == "processing_timeout"
+    assert "Processing was interrupted" in stale.verification_reasons[0]
+    assert fresh.status == SubmissionStatus.PROCESSING
+    assert teacher_upload.status == SubmissionStatus.PROCESSING
+
+
+def test_can_resubmit_uses_server_assignment_rules(db):
+    _, student, assignment = setup_assignment(db)
+    submission = create_submission(db, student, assignment)
+    assert submission.can_resubmit is True
+    assert submission_router.get_submission(submission.id, student, db)["can_resubmit"] is True
+
+    assignment.due_date = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+    assert submission.can_resubmit is False
+    assert submission_router.get_submission(submission.id, student, db)["can_resubmit"] is False
+
+    assignment.due_date = None
+    assignment.is_active = False
+    db.commit()
+    assert submission.can_resubmit is False
+
+
+def test_teacher_review_route_marks_submission_as_non_deletable(db):
+    teacher, student, assignment = setup_assignment(db)
+    submission = create_submission(db, student, assignment)
+    evaluation = Evaluation(
+        submission_id=submission.id,
+        rubric_id=_rubric_id(db),
+        is_reviewed=False,
+    )
+    db.add(evaluation)
+    db.commit()
+
+    reviewed = submission_router.review_evaluation(evaluation.id, teacher, db)
+
+    assert reviewed.is_reviewed is True
+    with pytest.raises(HTTPException) as error:
+        submission_router.delete_student_submission(submission.id, student, db)
+    assert error.value.status_code == 409
+
+
+def test_student_cannot_delete_another_students_or_teacher_uploaded_submission(db):
+    _, student, assignment = setup_assignment(db)
+    other_student = User(
+        email="other-student@example.test",
+        full_name="Synthetic Other Student",
+        hashed_password="hash",
+        role=UserRole.STUDENT,
+    )
+    db.add(other_student)
+    db.commit()
+    submission = create_submission(db, student, assignment)
+
+    with pytest.raises(HTTPException) as missing:
+        submission_router.delete_student_submission(submission.id, other_student, db)
+    assert missing.value.status_code == 404
+
+    submission.source = SubmissionSource.TEACHER_UPLOAD
+    db.commit()
+    with pytest.raises(HTTPException) as blocked:
+        submission_router.delete_student_submission(submission.id, student, db)
+    assert blocked.value.status_code == 409
+
+
+def test_delete_after_due_date_is_allowed_but_resubmission_is_rejected(db, monkeypatch):
+    _, student, assignment = setup_assignment(db)
+    assignment.due_date = datetime.now(timezone.utc) - timedelta(days=1)
+    submission = create_submission(db, student, assignment)
+
+    class Storage:
+        def save(self, *_args):
+            raise AssertionError("expired submissions must not be stored")
+
+        def delete(self, _object_key):
+            return None
+
+    monkeypatch.setattr(submission_router, "get_storage", lambda: Storage())
+    deleted = submission_router.delete_student_submission(submission.id, student, db)
+    assert deleted.status_code == 204
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            submission_router.upload_submission(
+                UploadFile(filename="resubmission.py", file=io.BytesIO(b"print('synthetic')")),
+                assignment.id,
+                student,
+                db,
+            )
+        )
+    assert error.value.status_code == 400
+    assert error.value.detail == "The assignment due date has passed"
 
 
 def test_teacher_override_records_audit_and_grades(db, monkeypatch):
@@ -569,10 +978,10 @@ def test_replacing_file_clears_old_verification_and_runs_stage_zero(db, monkeypa
     monkeypatch.setattr(SubmissionVerificationService, "verify", observe_verification)
 
     async def save_upload(_file, _name):
-        return "replacement.txt"
+        return "replacement.py"
 
     monkeypatch.setattr(submission_router, "_save_upload", save_upload)
-    upload = UploadFile(filename="replacement.txt", file=io.BytesIO(b"replacement"))
+    upload = UploadFile(filename="replacement.py", file=io.BytesIO(b"replacement"))
     result = asyncio.run(
         submission_router.replace_submission(submission.id, upload, student, db)
     )
@@ -583,7 +992,7 @@ def test_replacing_file_clears_old_verification_and_runs_stage_zero(db, monkeypa
     assert submission.content_hash != "old-hash"
     assert submission.verification_error_code is None
     assert submission.verification_reasons != ["Old file was unrelated."]
-    assert submission.file_path == "replacement.txt"
+    assert submission.file_path == "replacement.py"
     assert submission.status == SubmissionStatus.READY
 
 

@@ -4,7 +4,7 @@ import re
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import httpx
 
@@ -98,11 +98,17 @@ class StudentCandidate:
     roll_no: str | None = None
 
 
+class StudentMatchCandidate(TypedDict):
+    student_id: int
+    full_name: str
+    score: int
+
+
 @dataclass(frozen=True)
 class StudentMatch:
     match_status: str
     resolved_student_id: int | None
-    candidates: tuple[dict[str, int | str], ...]
+    candidates: tuple[StudentMatchCandidate, ...]
 
 
 def normalize_name(name: str) -> str:
@@ -241,17 +247,15 @@ def match_student(
     if not 0 <= ambiguity_margin <= 1:
         raise ValueError("Student match ambiguity margin must be between 0 and 1")
 
-    scored = sorted(
-        (
-            {
-                "student_id": student.id,
-                "full_name": student.full_name,
-                "score": _name_score(detected_name, student.full_name),
-            }
-            for student in students
-        ),
-        key=lambda candidate: (-int(candidate["score"]), str(candidate["full_name"])),
-    )
+    scored: list[StudentMatchCandidate] = [
+        {
+            "student_id": student.id,
+            "full_name": student.full_name,
+            "score": _name_score(detected_name, student.full_name),
+        }
+        for student in students
+    ]
+    scored.sort(key=lambda candidate: (-int(candidate["score"]), str(candidate["full_name"])))
     top_candidates = tuple(scored[:3])
     if not scored or int(scored[0]["score"]) / 100 < low_threshold:
         return StudentMatch("unmatched", None, top_candidates)

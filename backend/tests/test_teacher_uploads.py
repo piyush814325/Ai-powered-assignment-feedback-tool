@@ -638,7 +638,7 @@ def test_restricted_assignment_confirmation_rejects_ineligible_student(upload_te
     assert "not assigned" in response.json()["detail"]
 
 
-def test_duplicate_file_is_flagged_without_replacing_submission(
+def test_duplicate_file_requires_explicit_replacement_of_unreviewed_submission(
     upload_test_context, monkeypatch
 ):
     context = upload_test_context
@@ -667,10 +667,13 @@ def test_duplicate_file_is_flagged_without_replacing_submission(
     ).json()
     assert second_batch["files"][0]["status"] == "duplicate"
     assert second_batch["files"][0]["submission_id"] is None
+    assert second_batch["files"][0]["existing_submission_reviewed"] is False
 
     db: Session = context["factory"]()
     try:
         assert db.query(Submission).count() == 1
+        existing_submission = db.query(Submission).one()
+        existing_file_path = existing_submission.file_path
         first_batch_id = first_response.json()["id"]
         duplicate_file = (
             db.query(UploadBatchFile)
@@ -687,10 +690,84 @@ def test_duplicate_file_is_flagged_without_replacing_submission(
     assert not_confirmed.status_code == 409
     confirmed = context["client"].post(
         f"/teacher/uploads/{second_response.json()['id']}/files/{duplicate_file.id}/confirm",
-        json={"student_id": context["ids"]["student"], "allow_duplicate": True},
+        json={"student_id": context["ids"]["student"], "replace_existing": True},
     )
     assert confirmed.status_code == 202
     assert first_batch_id != second_response.json()["id"]
+    assert existing_file_path not in context["storage"].files
+
+    db = context["factory"]()
+    try:
+        assert db.query(Submission).count() == 1
+        replacement = db.query(Submission).one()
+        assert replacement.id == confirmed.json()["submission_id"]
+        assert replacement.file_path != existing_file_path
+    finally:
+        db.close()
+
+
+def test_reviewed_teacher_duplicate_can_only_be_rejected(upload_test_context, monkeypatch):
+    context = upload_test_context
+    _remove_similar_student(context)
+
+    async def grade(submission_id, _rubric_id, _use_mock, db, **_kwargs):
+        submission = db.query(Submission).filter(Submission.id == submission_id).one()
+        submission.status = SubmissionStatus.READY
+        db.commit()
+        return {}
+
+    monkeypatch.setattr(teacher_uploads, "_evaluate_submission", grade)
+    first = context["client"].post(
+        "/teacher/uploads",
+        data={"assignment_id": context["ids"]["assignment"]},
+        files={"files": ("Vexari_Quorium.csv", _csv(), "text/csv")},
+    )
+    db: Session = context["factory"]()
+    try:
+        existing = db.query(Submission).one()
+        existing_id = existing.id
+        db.add(Evaluation(
+            submission_id=existing.id,
+            rubric_id=context["ids"]["rubric"],
+            total_score=90,
+            is_reviewed=True,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    second = context["client"].post(
+        "/teacher/uploads",
+        data={"assignment_id": context["ids"]["assignment"]},
+        files={"files": ("Vexari_Quorium.csv", _csv(), "text/csv")},
+    )
+    batch = context["client"].get(f"/teacher/uploads/{second.json()['id']}").json()
+    duplicate = batch["files"][0]
+    assert duplicate["status"] == "duplicate"
+    assert duplicate["existing_submission_reviewed"] is True
+    assert duplicate["existing_submission_id"] == existing_id
+
+    conflict = context["client"].post(
+        f"/teacher/uploads/{second.json()['id']}/files/{duplicate['id']}/confirm",
+        json={
+            "student_id": context["ids"]["student"],
+            "replace_existing": True,
+        },
+    )
+    assert conflict.status_code == 409
+    assert "reviewed" in conflict.json()["detail"]
+    rejected = context["client"].post(
+        f"/teacher/uploads/{second.json()['id']}/files/{duplicate['id']}/reject",
+        json={"reason": "Reviewed existing submission; reject this file."},
+    )
+    assert rejected.status_code == 200
+    assert first.status_code == 202
+    db = context["factory"]()
+    try:
+        assert db.query(Submission).count() == 1
+        assert db.get(Submission, existing_id) is not None
+    finally:
+        db.close()
 
 
 def test_student_visibility_hides_unreviewed_teacher_evaluation_and_file(
@@ -801,6 +878,126 @@ def test_student_upload_visibility_is_unchanged(upload_test_context):
     result = context["client"].get("/submissions/").json()[0]
     assert result["status"] == "ready"
     assert result["evaluation"]["feedback"]["one"] == "visible"
+
+def test_submission_file_endpoint_authorization_headers_and_size_limit(
+    upload_test_context, monkeypatch
+):
+    context = upload_test_context
+    ids = context["ids"]
+    pdf_key = "submissions/synthetic-original.pdf"
+    code_key = "submissions/synthetic-page.html"
+    docx_key = "submissions/synthetic-original.docx"
+    missing_key = "submissions/not-present.pdf"
+    hostile_filename = '../folder/"bad"\r\nX-Test: injected.pdf'
+    db: Session = context["factory"]()
+    try:
+        pdf_submission = Submission(
+            student_id=ids["student"],
+            assignment_id=ids["assignment"],
+            file_path=pdf_key,
+            original_filename=hostile_filename,
+            file_type="pdf",
+            status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
+        )
+        code_submission = Submission(
+            student_id=ids["similar_student"],
+            assignment_id=ids["assignment"],
+            file_path=code_key,
+            original_filename="page.html",
+            file_type="code",
+            status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
+        )
+        teacher_upload = Submission(
+            student_id=ids["student"],
+            assignment_id=ids["other_assignment"],
+            file_path=docx_key,
+            original_filename="original.docx",
+            file_type="docx",
+            status=SubmissionStatus.READY,
+            source=SubmissionSource.TEACHER_UPLOAD,
+        )
+        missing_submission = Submission(
+            student_id=ids["similar_student"],
+            assignment_id=ids["other_assignment"],
+            file_path=missing_key,
+            original_filename="missing.pdf",
+            file_type="pdf",
+            status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
+        )
+        db.add_all([pdf_submission, code_submission, teacher_upload, missing_submission])
+        db.flush()
+        db.add(Evaluation(
+            submission_id=teacher_upload.id,
+            rubric_id=ids["rubric"],
+            total_score=88,
+            is_reviewed=False,
+        ))
+        db.commit()
+        pdf_id = pdf_submission.id
+        code_id = code_submission.id
+        teacher_upload_id = teacher_upload.id
+        missing_id = missing_submission.id
+    finally:
+        db.close()
+
+    context["storage"].files[pdf_key] = b"%PDF-1.7 synthetic pdf"
+    context["storage"].files[code_key] = b"<html>not html served</html>"
+    context["storage"].files[docx_key] = b"synthetic docx"
+
+    teacher_pdf = context["client"].get(f"/submissions/{pdf_id}/file")
+    assert teacher_pdf.status_code == 200
+    assert teacher_pdf.headers["content-type"] == "application/pdf"
+    assert teacher_pdf.headers["content-disposition"].startswith("inline;")
+    assert teacher_pdf.headers["x-content-type-options"] == "nosniff"
+    assert teacher_pdf.headers["cache-control"] == "private, no-store"
+    disposition = teacher_pdf.headers["content-disposition"]
+    assert "\r" not in disposition and "\n" not in disposition
+    assert "../" not in disposition and "X-Test: injected" not in disposition
+
+    assert context["client"].get(
+        f"/submissions/{pdf_id}/file?download=1"
+    ).headers["content-disposition"].startswith("attachment;")
+    context["acting"]["user_id"] = ids["other_teacher"]
+    assert context["client"].get(f"/submissions/{pdf_id}/file").status_code == 404
+    context["acting"]["user_id"] = ids["admin"]
+    assert context["client"].get(f"/submissions/{pdf_id}/file").status_code == 200
+    context["acting"]["user_id"] = ids["student"]
+    assert context["client"].get(f"/submissions/{pdf_id}/file").status_code == 200
+    assert context["client"].get(f"/submissions/{code_id}/file").status_code == 404
+
+    hidden_teacher_file = context["client"].get(
+        f"/submissions/{teacher_upload_id}/file"
+    )
+    assert hidden_teacher_file.status_code == 404
+    db = context["factory"]()
+    try:
+        db.query(Evaluation).filter(
+            Evaluation.submission_id == teacher_upload_id
+        ).one().is_reviewed = True
+        db.commit()
+    finally:
+        db.close()
+    released_teacher_file = context["client"].get(
+        f"/submissions/{teacher_upload_id}/file"
+    )
+    assert released_teacher_file.status_code == 200
+    assert released_teacher_file.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert released_teacher_file.headers["content-disposition"].startswith("attachment;")
+    context["acting"]["user_id"] = ids["teacher"]
+    assert context["client"].get(f"/submissions/{missing_id}/file").status_code == 404
+    code_response = context["client"].get(f"/submissions/{code_id}/file")
+    assert code_response.status_code == 200
+    assert code_response.headers["content-type"] == "text/plain; charset=utf-8"
+    assert code_response.headers["content-disposition"].startswith("attachment;")
+    assert "text/html" not in code_response.headers["content-type"]
+
+    monkeypatch.setattr(submissions, "MAX_UPLOAD_BYTES", 4)
+    assert context["client"].get(f"/submissions/{pdf_id}/file").status_code == 413
 
 
 def test_student_cannot_approve_evaluation_to_release_results(upload_test_context):
@@ -1094,6 +1291,35 @@ def test_teacher_upload_batch_list_is_scoped_paginated_and_has_file_counts(
     admin_page = context["client"].get("/teacher/uploads?limit=10&offset=0")
     assert admin_page.status_code == 200
     assert admin_page.json()["total"] == 3
+
+
+def test_recent_upload_summary_includes_matched_student_names(upload_test_context):
+    context = upload_test_context
+    db: Session = context["factory"]()
+    try:
+        batch = UploadBatch(
+            teacher_id=context["ids"]["teacher"],
+            file_count=1,
+            status=UploadBatchStatus.COMPLETED,
+        )
+        db.add(batch)
+        db.flush()
+        db.add(UploadBatchFile(
+            batch_id=batch.id,
+            storage_key="submissions/synthetic-recent.csv",
+            original_filename="synthetic-recent.csv",
+            status=UploadBatchFileStatus.GRADED,
+            resolved_student_id=context["ids"]["student"],
+        ))
+        db.commit()
+        batch_id = batch.id
+    finally:
+        db.close()
+
+    response = context["client"].get("/teacher/uploads?limit=10&offset=0")
+    assert response.status_code == 200
+    summary = next(item for item in response.json()["items"] if item["id"] == batch_id)
+    assert summary["student_names"] == ["Vexari Quorium"]
 
 
 def test_admin_can_manage_assignees(upload_test_context):
@@ -2325,6 +2551,15 @@ def test_student_submission_delete_ownership_grade_lock_and_topic(upload_test_co
     try:
         assignment = db.get(Assignment, ids["assignment"])
         assignment.due_date = datetime.now(timezone.utc) + timedelta(days=1)
+        reviewed_assignment = Assignment(
+            teacher_id=ids["teacher"],
+            subject_name="Reviewed subject",
+            subject_code="REV1",
+            title="Reviewed assignment",
+            max_score=100,
+            allowed_file_types=["pdf"],
+            rubric=[{"key": "one", "label": "One", "max_points": 100}],
+        )
         locked_assignment = Assignment(
             teacher_id=ids["teacher"],
             subject_name="Locked subject",
@@ -2335,7 +2570,7 @@ def test_student_submission_delete_ownership_grade_lock_and_topic(upload_test_co
             rubric=[{"key": "one", "label": "One", "max_points": 100}],
             due_date=datetime.now(timezone.utc) - timedelta(days=1),
         )
-        db.add(locked_assignment)
+        db.add_all([reviewed_assignment, locked_assignment])
         db.flush()
         db.add(
             AssignmentAssignee(
@@ -2349,24 +2584,28 @@ def test_student_submission_delete_ownership_grade_lock_and_topic(upload_test_co
             assignment_id=assignment.id,
             file_path="submissions/ungraded.pdf",
             status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
         )
         graded = Submission(
             student_id=ids["student"],
-            assignment_id=assignment.id,
+            assignment_id=reviewed_assignment.id,
             file_path="submissions/graded.pdf",
             status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
         )
         locked = Submission(
             student_id=ids["student"],
             assignment_id=locked_assignment.id,
             file_path="submissions/locked.pdf",
             status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
         )
         other_student = Submission(
             student_id=ids["similar_student"],
             assignment_id=assignment.id,
             file_path="submissions/other-student.pdf",
             status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
         )
         db.add_all([ungraded, graded, locked, other_student])
         db.flush()
@@ -2381,6 +2620,7 @@ def test_student_submission_delete_ownership_grade_lock_and_topic(upload_test_co
             total_score=80,
             scores={"one": 80},
             feedback={"one": "Graded"},
+            is_reviewed=True,
         )
         db.add_all([ungraded_evaluation, graded_evaluation])
         db.flush()
@@ -2412,21 +2652,21 @@ def test_student_submission_delete_ownership_grade_lock_and_topic(upload_test_co
 
     context["acting"]["user_id"] = ids["student"]
     own_response = context["client"].delete(
-        f"/student/submissions/{ungraded_id}"
+        f"/submissions/{ungraded_id}"
     )
     assert own_response.status_code == 204
     assert context["client"].delete(
-        f"/student/submissions/{ungraded_id}"
+        f"/submissions/{ungraded_id}"
     ).status_code == 404
     assert context["client"].delete(
-        f"/student/submissions/{other_id}"
+        f"/submissions/{other_id}"
     ).status_code == 404
     assert context["client"].delete(
-        f"/student/submissions/{graded_id}"
+        f"/submissions/{graded_id}"
     ).status_code == 409
     assert context["client"].delete(
-        f"/student/submissions/{locked_id}"
-    ).status_code == 409
+        f"/submissions/{locked_id}"
+    ).status_code == 204
 
     db = context["factory"]()
     try:
@@ -2442,11 +2682,71 @@ def test_student_submission_delete_ownership_grade_lock_and_topic(upload_test_co
             Feedback.evaluation_id == ungraded_evaluation.id
         ).count() == 0
         assert db.get(Submission, graded_id) is not None
-        assert db.get(Submission, locked_id) is not None
+        assert db.get(Submission, locked_id) is None
     finally:
         db.close()
     assert ungraded_key not in context["storage"].files
-    assert locked_key in context["storage"].files
+    assert locked_key not in context["storage"].files
+
+def test_legacy_student_delete_alias_uses_shared_ownership_source_and_review_rules(
+    upload_test_context,
+):
+    context = upload_test_context
+    ids = context["ids"]
+    db: Session = context["factory"]()
+    try:
+        reviewed = Submission(
+            student_id=ids["student"],
+            assignment_id=ids["assignment"],
+            file_path="submissions/legacy-reviewed.py",
+            file_type="code",
+            status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
+        )
+        other_student = Submission(
+            student_id=ids["similar_student"],
+            assignment_id=ids["assignment"],
+            file_path="submissions/legacy-other.py",
+            file_type="code",
+            status=SubmissionStatus.READY,
+            source=SubmissionSource.STUDENT_UPLOAD,
+        )
+        teacher_upload = Submission(
+            student_id=ids["student"],
+            assignment_id=ids["other_assignment"],
+            file_path="submissions/legacy-teacher.csv",
+            file_type="spreadsheet",
+            status=SubmissionStatus.READY,
+            source=SubmissionSource.TEACHER_UPLOAD,
+        )
+        db.add_all([reviewed, other_student, teacher_upload])
+        db.flush()
+        db.add(Evaluation(
+            submission_id=reviewed.id,
+            rubric_id=ids["rubric"],
+            is_reviewed=True,
+        ))
+        db.commit()
+        reviewed_id = reviewed.id
+        other_student_id = other_student.id
+        teacher_upload_id = teacher_upload.id
+    finally:
+        db.close()
+
+    context["acting"]["user_id"] = ids["student"]
+    legacy_reviewed = context["client"].delete(
+        f"/student/submissions/{reviewed_id}"
+    )
+    assert legacy_reviewed.status_code == 409
+    assert legacy_reviewed.json()["detail"] == (
+        "This submission was already reviewed by your teacher and can't be deleted."
+    )
+    assert context["client"].delete(
+        f"/student/submissions/{other_student_id}"
+    ).status_code == 404
+    assert context["client"].delete(
+        f"/student/submissions/{teacher_upload_id}"
+    ).status_code == 409
 
 
 def test_assignment_deactivate_reactivate_preserves_existing_data(

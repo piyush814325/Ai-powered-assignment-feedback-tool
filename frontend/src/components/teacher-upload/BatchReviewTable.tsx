@@ -272,14 +272,13 @@ export function BatchReviewTable({
                             <table className="w-full table-fixed border-collapse text-left">
                                 <thead className="bg-muted/40 text-xs uppercase text-muted-foreground">
                                     <tr>
-                                        <th className="w-[12%] p-2">Filename</th>
+                                        <th className="w-[24%] p-2">Student / assignment</th>
+                                        <th className="w-[16%] p-2">File</th>
                                         <th className="w-[13%] p-2">Detected name</th>
-                                        <th className="w-[11%] p-2">Matched student</th>
                                         <th className="w-[9%] p-2">Match</th>
-                                        <th className="w-[10%] p-2">Topic</th>
                                         <th className="w-[9%] p-2">Grading</th>
-                                        <th className="w-[11%] p-2">Error</th>
-                                        <th className="w-[25%] p-2">Actions</th>
+                                        <th className="w-[10%] p-2">Error</th>
+                                        <th className="w-[19%] p-2">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody>

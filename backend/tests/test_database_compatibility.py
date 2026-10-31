@@ -23,6 +23,7 @@ from app.models import (
     Assignment,
     Evaluation,
     Submission,
+    SUBMISSION_STUDENT_ASSIGNMENT_INDEX,
     SubmissionStatus,
     UploadBatch,
     UploadBatchStatus,
@@ -90,7 +91,7 @@ def _create_related_rows(db: Session):
         subject_code=f"CS-{suffix[:8]}",
         title="Binary tree",
         max_score=100,
-        allowed_file_types=["txt"],
+        allowed_file_types=["pdf", "docx", "code"],
         rubric=[{"key": "correctness", "label": "Correctness", "max_points": 100}],
     )
     db.add(assignment)
@@ -105,6 +106,84 @@ def _create_related_rows(db: Session):
     db.add(submission)
     db.flush()
     return teacher, student, assignment, submission
+
+
+def test_allowed_file_types_strip_legacy_txt_and_image_values():
+    from app.routers.assignments import normalize_allowed_file_types
+
+    assert normalize_allowed_file_types(["txt", "image", "pdf", "docx"]) == ["pdf", "docx"]
+    assert normalize_allowed_file_types(["image", "txt"]) == ["pdf", "docx", "code"]
+    assert normalize_allowed_file_types(["pdf", "docx", "code"]) == ["pdf", "docx", "code"]
+
+
+def test_submission_unique_index_rejects_second_student_assignment_row():
+    db_engine = create_engine("sqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(bind=db_engine)
+    db = Session(db_engine)
+    try:
+        _, student, assignment, _ = _create_related_rows(db)
+        db.commit()
+        db.add(Submission(
+            student_id=student.id,
+            assignment_id=assignment.id,
+            file_path="submissions/second.py",
+            file_type="code",
+            status=SubmissionStatus.UPLOADED,
+        ))
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+        assert db.query(Submission).filter(
+            Submission.student_id == student.id,
+            Submission.assignment_id == assignment.id,
+        ).count() == 1
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=db_engine)
+        db_engine.dispose()
+
+
+def test_duplicate_submission_migration_skips_index_and_logs_counts(caplog):
+    db_engine = create_engine("sqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(bind=db_engine)
+    db = Session(db_engine)
+    try:
+        _, student, assignment, first = _create_related_rows(db)
+        db.commit()
+        with db_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP INDEX "{SUBMISSION_STUDENT_ASSIGNMENT_INDEX}"'
+            )
+        db.add(Submission(
+            student_id=student.id,
+            assignment_id=assignment.id,
+            file_path="submissions/duplicate.py",
+            file_type="code",
+            status=SubmissionStatus.UPLOADED,
+        ))
+        db.commit()
+
+        with caplog.at_level("WARNING"):
+            _ensure_indexes(db_engine)
+
+        assert db.query(Submission).filter(
+            Submission.student_id == student.id,
+            Submission.assignment_id == assignment.id,
+        ).count() == 2
+        index_names = {
+            index["name"] for index in inspect(db_engine).get_indexes("submissions")
+        }
+        assert SUBMISSION_STUDENT_ASSIGNMENT_INDEX not in index_names
+        assert "duplicate_groups=1 duplicate_rows=2" in caplog.text
+        warning = next(
+            record for record in caplog.records
+            if "Skipped unique submission index" in record.message
+        )
+        assert warning.args == (1, 2)
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=db_engine)
+        db_engine.dispose()
 
 
 def test_postgres_url_normalization():

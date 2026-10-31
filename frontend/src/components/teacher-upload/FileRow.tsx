@@ -84,7 +84,7 @@ export function FileRow({ batchId, file, assignments, onRefresh, onOpenSubmissio
         if (conflict) await onRefresh();
     };
 
-    const confirm = async (allowDuplicate = false) => {
+    const confirm = async (replaceExisting = false) => {
         if (studentId === null || (!assignmentId && file.resolved_assignment_id === null)) return;
         setBusy(true);
         setError(null);
@@ -94,7 +94,7 @@ export function FileRow({ batchId, file, assignments, onRefresh, onOpenSubmissio
                 file.id,
                 studentId,
                 assignmentId || undefined,
-                allowDuplicate,
+                replaceExisting,
             );
             setDuplicateOpen(false);
             await onRefresh();
@@ -168,7 +168,18 @@ export function FileRow({ batchId, file, assignments, onRefresh, onOpenSubmissio
 
     return (
         <tr className="border-t border-border align-top">
-            <td className="min-w-0 break-words p-2 text-sm font-medium text-foreground">{file.filename}</td>
+            <td className="min-w-0 break-words p-2">
+                <p className="text-sm font-semibold text-foreground">
+                    {file.resolved_student_name || file.detected_name || 'Student not matched'}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                    {file.resolved_assignment_name || 'Assignment not selected'}
+                </p>
+            </td>
+            <td className="min-w-0 break-words p-2 text-sm">
+                <span className="text-foreground">{file.filename}</span>
+                <span className="mt-1 block text-xs text-muted-foreground">Spreadsheet</span>
+            </td>
             <td className="min-w-0 break-words p-2 text-sm">
                 <span className="text-foreground">{file.detected_name || 'Not detected'}</span>
                 {file.detected_name_source && (
@@ -177,13 +188,11 @@ export function FileRow({ batchId, file, assignments, onRefresh, onOpenSubmissio
                     </span>
                 )}
             </td>
-            <td className="min-w-0 break-words p-2 text-sm text-foreground">{file.resolved_student_name || '—'}</td>
             <td className="min-w-0 p-2">
                 <Badge variant={file.status === 'imported' ? 'neutral' : badgeVariant(file.match_status ?? '')}>
                     {file.status === 'imported' ? 'Imported' : file.status === 'roster_detected' ? 'Class list detected' : readableStatus(file.match_status)}
                 </Badge>
             </td>
-            <td className="min-w-0 break-words p-2 text-sm text-foreground">{file.resolved_assignment_name || '—'}</td>
             <td className="min-w-0 p-2">
                 <Badge variant={badgeVariant(file.grading_status ?? '')}>
                     {readableStatus(file.grading_status)}
@@ -261,9 +270,15 @@ export function FileRow({ batchId, file, assignments, onRefresh, onOpenSubmissio
                             )}
                             {file.status === 'duplicate' ? (
                                 <div className="flex flex-wrap gap-2">
-                                    <Button size="sm" onClick={() => setDuplicateOpen(true)} disabled={busy || studentId === null || (!assignmentId && requiresAssignment)}>
-                                        Create anyway
-                                    </Button>
+                                    {file.existing_submission_reviewed ? (
+                                        <Alert variant="warning">
+                                            This submission was reviewed by the teacher. Reject this file; reviewed work cannot be replaced.
+                                        </Alert>
+                                    ) : (
+                                        <Button size="sm" onClick={() => setDuplicateOpen(true)} disabled={busy || studentId === null || (!assignmentId && requiresAssignment)}>
+                                            Replace existing submission
+                                        </Button>
+                                    )}
                                     <Button size="sm" variant="outline" onClick={() => setRejectOpen(true)} disabled={busy}>Reject</Button>
                                 </div>
                             ) : (

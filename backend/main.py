@@ -95,12 +95,8 @@ def initialize_database() -> None:
             Base.metadata.create_all(bind=engine)
             run_migrations(engine)
             schedule_stale_upload_sweep()
+            submissions.schedule_stale_submission_sweep()
             seed_default_rubric()
-            if not DocumentParser.tesseract_available():
-                logger.warning(
-                    "Tesseract OCR binary is unavailable; scanned/image-only submissions "
-                    "will be marked unverifiable or not evaluated."
-                )
             return
         except OperationalError as error:
             safe_message = sanitize_database_error(error)
